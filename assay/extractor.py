@@ -182,8 +182,9 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
             continue
 
         label = _detect_heading_label(full_text, max_font)
+        bbox = tuple(round(v, 1) for v in block.get("bbox", (0, 0, 0, 0)))
         outputs.append(TextOutput(
-            text=full_text, page_no=page_idx, label=label,
+            text=full_text, page_no=page_idx, label=label, bbox=bbox,
         ))
 
     return outputs

@@ -105,6 +105,9 @@ class TextOutput:
     text: str
     page_no: int
     label: str = "text"  # 'text', 'section_heading', 'title'
+    bbox: Tuple[float, float, float, float] = (0, 0, 0, 0)
+    """Block bbox in PDF points; (0,0,0,0) when unknown.  Lets the export
+    drop table-internal text and interleave by reading order."""
 
 
 @dataclass
@@ -152,25 +155,74 @@ def export_to_markdown(doc: DocumentOutput) -> str:
         else:
             lines.append(f"\n<!-- Page {page_no} -->\n")
 
-        # Output text blocks for this page
-        for elem in page_texts.get(page_no, []):
-            label = elem.label
-            if label == "section_heading":
-                lines.append(f"\n## {elem.text}\n")
-            elif label == "subsection_heading":
-                lines.append(f"\n### {elem.text}\n")
-            elif label == "title":
-                lines.append(f"\n# {elem.text}\n")
-            elif elem.text.strip():
-                lines.append(f"{elem.text}\n")
+        tables = page_tables.get(page_no, [])
+        # Reading order: interleave texts and tables by their top y.
+        # Table position = top of its cell grid (the grid, not the
+        # detection box, is where the rendered table actually starts, so
+        # a scope label absorbed above the grid keeps sorting before it).
+        items = []
+        for t in page_texts.get(page_no, []):
+            if _is_table_text(t, tables):
+                continue        # table cell text — rendered in the table
+            items.append((t.bbox[1] if t.bbox[3] > t.bbox[1] else 1e9,
+                          len(items), ("text", t)))
+        for tb in tables:
+            y = _table_top(tb)
+            items.append((y, len(items), ("table", tb)))
+        items.sort(key=lambda it: (it[0], it[1]))
 
-        # Output tables for this page
-        for table in page_tables.get(page_no, []):
-            table_md = _table_to_md(table)
-            lines.append(table_md)
-            lines.append("")
+        for _, _, (kind, obj) in items:
+            if kind == "text":
+                label = obj.label
+                if label == "section_heading":
+                    lines.append(f"\n## {obj.text}\n")
+                elif label == "subsection_heading":
+                    lines.append(f"\n### {obj.text}\n")
+                elif label == "title":
+                    lines.append(f"\n# {obj.text}\n")
+                elif obj.text.strip():
+                    lines.append(f"{obj.text}\n")
+            else:
+                lines.append(_table_to_md(obj))
+                lines.append("")
 
     return "\n".join(lines)
+
+
+def _table_top(table: TableOutput) -> float:
+    """Top y of a table's rendered grid (falls back to the detection box)."""
+    ys = [c.bbox[1] for c in table.cells if c.bbox[3] > c.bbox[1]]
+    return min(ys) if ys else table.table_bbox[1]
+
+
+def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
+    """
+    True when a text block is table cell content: cells of one table
+    cover >=50% of the block.  Coverage accumulates over the table's
+    cells because PyMuPDF often packs a whole table (or a wide span of
+    rows) into ONE text block — per-cell tests would then see only a
+    small fraction each and the block would leak as prose.  Scope labels
+    and captions absorbed into a table's detection box sit above the
+    cells, so they survive and keep their reading-order slot.
+    """
+    bx0, by0, bx1, by1 = text.bbox
+    if bx1 <= bx0 or by1 <= by0:
+        return False
+    barea = (bx1 - bx0) * (by1 - by0)
+    for table in tables:
+        inter = 0.0
+        for c in table.cells:
+            r = c.bbox
+            if r[2] <= r[0] or r[3] <= r[1]:
+                continue
+            ix0, iy0 = max(bx0, r[0]), max(by0, r[1])
+            ix1, iy1 = min(bx1, r[2]), min(by1, r[3])
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            inter += (ix1 - ix0) * (iy1 - iy0)
+        if inter >= 0.5 * barea:
+            return True
+    return False
 
 
 def _table_to_md(table: TableOutput) -> str:
@@ -225,7 +277,11 @@ def export_to_dict(doc: DocumentOutput) -> dict:
             {
                 "text": t.text,
                 "label": t.label,
-                "prov": [{"page_no": t.page_no, "bbox": None}],
+                "prov": [{
+                    "page_no": t.page_no,
+                    "bbox": ([round(v, 1) for v in t.bbox]
+                             if t.bbox[3] > t.bbox[1] else None),
+                }],
             }
             for t in doc.texts if t.text.strip()
         ],
