@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.whl
+
+# C++
+*.o
+*.so
+*.dylib
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (large binary files)
+*.safetensors
+*.onnx
+*.trt
+*.engine
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# Output
+output/
+*.log
+
+# Virtual env
+venv/
+.venv/
+
+# Backup files
+*.bak*

@@ -1,0 +1,178 @@
+"""
+Multi-worker pipeline orchestrator using ProcessPoolExecutor.
+
+Architecture:
+  - N CPU workers, each loading its own TableModel (shared-nothing)
+  - Each worker processes one PDF independently
+  - Files distributed via ProcessPoolExecutor
+  - CUDA time-slicing handles concurrent GPU access transparently
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import os
+import time
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, Tuple
+
+import torch
+
+_log = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-file worker function (runs inside each ProcessPoolExecutor worker)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _process_one(args: Tuple[str, str, int, bool, bool, bool]) -> Dict:
+    """
+    Process a single PDF inside a worker process.
+
+    This is the entry point for ProcessPoolExecutor. Each worker:
+      1. Loads its own TableModel (ONNX on GPU or CPU)
+      2. Extracts tables using AssayExtractor
+      3. Writes markdown (+ JSON unless no_json=True)
+    """
+    pdf_path, output_dir, worker_id, no_json, use_gpu, debug_pdf = args
+
+    # Minimize CPU thread contention between workers
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    logging.getLogger().setLevel(logging.WARNING)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    torch.set_num_threads(1)
+
+    from assay.models import TableModel
+    from assay.extractor import AssayExtractor
+    from assay.output import write_markdown, write_json, write_debug_pdf
+
+    file_stem = Path(pdf_path).stem
+    start_time = time.time()
+
+    try:
+        model = TableModel(use_gpu=use_gpu)
+        extractor = AssayExtractor(model)
+        doc = extractor.extract(pdf_path)
+
+        # Write output
+        out_dir = Path(output_dir) / file_stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_markdown(doc, str(out_dir / f"{file_stem}.md"))
+        if not no_json:
+            write_json(doc, str(out_dir / f"{file_stem}.json"), indent=2)
+        if debug_pdf:
+            debug_path = str(out_dir / f"{file_stem}_layout.pdf")
+            write_debug_pdf(doc, pdf_path, debug_path)
+
+        elapsed = time.time() - start_time
+        return {
+            'file_name': file_stem,
+            'status': 'SUCCESS',
+            'tables': len(doc.tables),
+            'time_sec': elapsed,
+            'worker': f'W{worker_id:02d}',
+        }
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        _log.error(f"Worker {worker_id} failed on {file_stem}: {e}", exc_info=True)
+        return {
+            'file_name': file_stem,
+            'status': 'ERROR',
+            'error': str(e),
+            'time_sec': elapsed,
+            'worker': f'W{worker_id:02d}',
+        }
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def run(
+    pdf_dir: str,
+    output_dir: str,
+    num_workers: int = 12,
+    use_gpu: bool = True,
+    no_json: bool = False,
+    debug_pdf: bool = False,
+) -> float:
+    """
+    Run the table extraction pipeline on all PDFs in a directory.
+
+    Args:
+        pdf_dir:     Directory containing PDF files.
+        output_dir:  Directory for markdown + JSON output.
+        num_workers: Number of parallel CPU workers (default 12).
+        use_gpu:     Use GPU for ONNX inference (default True).
+        no_json:     Skip JSON output (default False).
+        debug_pdf:   Generate layout-annotated PDF for verification (default False).
+
+    Returns:
+        Total wall time in seconds.
+    """
+    pdfs = sorted(Path(pdf_dir).glob("*.pdf"))
+    total = len(pdfs)
+    if total == 0:
+        print("Error: no PDF files found")
+        return 0.0
+
+    print(f"\n{'='*60}")
+    print(f"  Assay — Table Extraction Pipeline")
+    print(f"  Workers: {num_workers} | GPU: {'ON' if use_gpu else 'OFF'}")
+    print(f"  Files: {total} | Output: {output_dir}")
+    print(f"{'='*60}")
+
+    tasks = [(str(p), output_dir, i, no_json, use_gpu, debug_pdf) for i, p in enumerate(pdfs)]
+
+    success, fail = 0, 0
+    total_tables = 0
+    t_start = time.time()
+
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        mp_context=torch.multiprocessing.get_context("spawn"),
+    ) as executor:
+        futures = {executor.submit(_process_one, task): task for task in tasks}
+
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                if res['status'] == 'SUCCESS':
+                    success += 1
+                    total_tables += res['tables']
+                    print(f"  [{success+fail:3d}/{total}] {res['worker']} | "
+                          f"{res['file_name'][:45]:45s} | "
+                          f"{res['time_sec']:5.1f}s | "
+                          f"{res['tables']:4d} tables",
+                          flush=True)
+                else:
+                    fail += 1
+                    print(f"  [{success+fail:3d}/{total}] {res['worker']} | "
+                          f"{res['file_name'][:45]:45s} | FAIL: "
+                          f"{res.get('error', 'unknown')[:50]}",
+                          flush=True)
+            except Exception as e:
+                fail += 1
+                print(f"  [{success+fail:3d}/{total}] ERROR | {str(e)[:60]}",
+                      flush=True)
+
+    elapsed = time.time() - t_start
+    print(f"{'='*60}")
+    print(f"  {success}/{total} succeeded, {fail} failed")
+    print(f"  {total_tables} tables extracted")
+    print(f"  Wall time: {elapsed:.1f}s ({elapsed/total:.1f}s/file)")
+    print(f"{'='*60}")
+
+    return elapsed

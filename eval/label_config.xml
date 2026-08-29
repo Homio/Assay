@@ -1,0 +1,7 @@
+<View>
+  <Image name="image" value="$image" zoom="true" zoomControl="true" negativeZoom="true"/>
+  <Header value="pdf: $pdf   |   page: $page   |   pipeline boxes: $n_pred   |   suspect: $suspect"/>
+  <RectangleLabels name="label" toName="image" strokeWidth="3">
+    <Label value="table" background="#2edb61"/>
+  </RectangleLabels>
+</View>
