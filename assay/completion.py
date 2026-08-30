@@ -410,6 +410,12 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
                     "y0": ly0, "y1": ly1, "x0": fx0, "x1": fx1,
                     "cx": (fx0 + fx1) / 2.0, "cy": (ly0 + ly1) / 2.0,
                     "text": text, "skeys": skeys,
+                    # character-level geometry: lets the caller split a
+                    # cross-column fragment at its internal gaps when a
+                    # column edge falls there （窄列里 "2,759,237" 与
+                    # "2,752,710" 间隙 <3pt 粘成一个片段的情形）
+                    "chars": [( (c[0]+c[2])/2.0, c[0], c[2], c[4])
+                              for c in run],
                 })
     fragments.sort(key=lambda f: (f["y0"], f["x0"]))
     return fragments
@@ -432,12 +438,42 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
     several columns is a spanning disclosure header
     （"截至或截止各年度12 月31 日" 通栏） — emitted as one cell with
     col_span instead of being scattered per column.
+
+    Narrow-column split: a fragment may blanket several columns when the
+    inter-value gap is under the fragment threshold
+    （资产负债摘要表 "2,759,2372,752,710"）.  Such a fragment is split
+    per character centre at each column edge it crosses — but only where
+    a real inter-glyph gap (>= 1.2 pt) sits at the edge, so unbroken
+    text never gets cut mid-glyph.
     """
     import bisect
     n_r, n_c = len(row_edges) - 1, len(col_edges) - 1
     colw = (col_edges[-1] - col_edges[0]) / max(1, n_c)
     keep = set(keep_rows) if keep_rows is not None else set(range(n_r))
     frags = _line_fragments(page, box)
+
+    def _col_of(x: float) -> int:
+        return min(max(bisect.bisect_right(col_edges, x) - 1, 0), n_c - 1)
+
+    def _split_fragment(f: dict) -> List[tuple]:
+        """Split a cross-column fragment at clean inter-glyph gaps that
+        fall on column edges.  Returns [(ci, text, x0, x1)]."""
+        runs = []
+        for cx, x0, x1, ch in f["chars"]:
+            ci = _col_of(cx)
+            if runs and runs[-1][0] == ci:
+                runs[-1][1].append((cx, x0, x1, ch))
+            elif runs and x0 - runs[-1][1][-1][2] < 1.2:
+                # 列界压在字形上：字符中心换列但墨迹连续 → 归前段
+                runs[-1][1].append((cx, x0, x1, ch))
+            else:
+                runs.append((ci, [(cx, x0, x1, ch)]))
+        out = []
+        for ci, cs in runs:
+            if cs:
+                out.append((ci, "".join(c[3] for c in cs),
+                            min(c[1] for c in cs), max(c[2] for c in cs)))
+        return out
 
     # group fragments per row interval (by fragment vertical centre)
     by_row: dict = {}
@@ -446,6 +482,33 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
                      0), n_r - 1)
         by_row.setdefault(ri, []).append(f)
 
+    # Gap completion: a wide inter-fragment gap (>=2pt) confirmed by
+    # several rows but lacking a column edge within ±3pt means the edge
+    # set is UNDER-FIT — the candidate competition tied on crossing
+    # rates and an under-fit candidate won （资产负债摘要表: 追溯后/
+    # 追溯前 boundary missing, "2,759,2372,752,710" fused）.  Insert
+    # boundaries at the confirmed gap midpoints — whitespace-only
+    # insertion, monotone safe.
+    gap_votes: dict = {}
+    n_multi = 0
+    for rfs in by_row.values():
+        rfs = sorted(rfs, key=lambda f: f["x0"])
+        if len(rfs) < 2:
+            continue
+        n_multi += 1
+        for a, b in zip(rfs, rfs[1:]):
+            gap = b["x0"] - a["x1"]
+            if gap >= 2.0:
+                mid = (a["x1"] + b["x0"]) / 2.0
+                if not any(abs(mid - e) <= 3.0 for e in col_edges[1:-1]):
+                    gap_votes.setdefault(round(mid / 5.0), []).append(mid)
+    need_votes = max(2, round(0.3 * n_multi))
+    for key, votes in list(gap_votes.items()):
+        if len(votes) >= need_votes:
+            import bisect as _b
+            _b.insort(col_edges, sum(votes) / len(votes))
+    n_c = len(col_edges) - 1
+
     cells: List[CellOutput] = []
     for ri in sorted(keep):
         row_frags = sorted(by_row.get(ri, []), key=lambda f: (f["y0"], f["x0"]))
@@ -453,12 +516,20 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
         placed: dict = {}
         order: List[tuple] = []
         for f in row_frags:
-            ci = min(max(bisect.bisect_right(col_edges, f["cx"]) - 1,
-                         0), n_c - 1)
-            if ci not in placed:
-                placed[ci] = []
-                order.append((ci, f["y0"]))
-            placed[ci].append(f)
+            # narrow-column split for cross-edge fragments
+            covered = _col_of(f["x0"]) != _col_of(f["x1"]) or \
+                any(col_edges[k] > f["x0"] and col_edges[k] < f["x1"]
+                    for k in range(1, len(col_edges) - 1))
+            pieces = _split_fragment(f) if covered else \
+                [(_col_of(f["cx"]), f["text"], f["x0"], f["x1"])]
+            for ci, text, px0, px1 in pieces:
+                if not text.strip():
+                    continue
+                if ci not in placed:
+                    placed[ci] = []
+                    order.append((ci, f["y0"]))
+                placed[ci].append({"text": text, "y0": f["y0"],
+                                   "x0": px0, "x1": px1})
         if not placed:
             continue
         # header mode: the whole row is 1-2 wide fragments
