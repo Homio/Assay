@@ -497,6 +497,61 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
     return cells
 
 
+# ── Wrapped-label band merge（三线表折行标签） ─────────────────────────────
+
+WRAP_FILL = 0.85       # 折行首行顶满标签列宽度的比例阈值
+WRAP_LEFT_TOL = 15.0   # 续行起始 x 与标签列左缘的容差（pt）
+
+
+def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
+    """
+    三线表（无行线）的折行标签修复：一个逻辑行的标签太长被折成两行、
+    数值与标签末行底部对齐时，文本带把一行拆成两行——首行只有标签
+    前半（值列全空）、次行是标签后半 + 全部数值。
+
+    合并判据（四条同时成立，缺一不并——这就是防打地鼠的约束）：
+      1. 首行所有片段都在标签列 x 范围内（值列无墨迹）；
+      2. 首行最右墨迹顶到标签列宽度的 85% 以上——折行的原因就是
+         顶边，分节行（"归属于："、"一、合营企业"）都是短标签，
+         到不了这条线；
+      3. 次行带数值片段（值在次行 = 数值与标签末行底部对齐的签名）；
+      4. 次行最左片段从标签列左缘接排（续行接排）。
+    连锁吸收：三行折行依次并入。规则路径不受影响（有行线的表由
+    横线定行，折行单元格天然保住）。
+    """
+    if len(edges) < 3 or len(rows) < 2:
+        return rows
+    lx0, lx1 = edges[0], edges[1]
+    lw = lx1 - lx0
+
+    def label_only_fills(band) -> bool:
+        spans = band[2]
+        if not spans:
+            return False
+        if any(x1 > lx1 + 4.0 for x0, x1, _t in spans):
+            return False          # 有墨迹越出标签列 = 带了值
+        return max(x1 for x0, x1, _t in spans) >= lx0 + WRAP_FILL * lw
+
+    def has_value_frags(band) -> bool:
+        return any(x0 > lx1 + 2.0 for x0, x1, _t in band[2])
+
+    out: list = []
+    i = 0
+    while i < len(rows):
+        cur = rows[i]
+        j = i + 1
+        while (j < len(rows)
+               and label_only_fills(cur)
+               and has_value_frags(rows[j])
+               and min(x0 for x0, x1, _t in rows[j][2]) <= lx0 + WRAP_LEFT_TOL):
+            cur = [min(cur[0], rows[j][0]), max(cur[1], rows[j][1]),
+                   sorted(cur[2] + rows[j][2], key=lambda s: (s[0], s[1]))]
+            j += 1
+        out.append(cur)
+        i = j
+    return out
+
+
 def rebuild_grid(page: fitz.Page, box: Rect,
                  col_edges: Optional[List[float]] = None,
                  src_cols: Optional[int] = None,
@@ -584,6 +639,16 @@ def rebuild_grid(page: fitz.Page, box: Rect,
         intervals = list(zip(yb, yb[1:]))
         n_rows = len(rows)
         row_edges = yb
+        rows = _merge_wrapped_label_bands(rows, edges)
+        if len(rows) != len(intervals):
+            # recompute boundaries from the merged band set
+            yb = [box[1]]
+            for a, b in zip(rows, rows[1:]):
+                yb.append((a[1] + b[0]) / 2)
+            yb.append(box[3])
+            intervals = list(zip(yb, yb[1:]))
+            n_rows = len(rows)
+            row_edges = yb
     cells = _cells_from_fragments(page, box, row_edges, edges,
                               keep_rows=keep_rows)
     if keep_rows is not None:
