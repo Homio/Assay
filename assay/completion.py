@@ -369,6 +369,134 @@ def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
     return [box[0]] + out + [box[2]] if out else []
 
 
+def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
+    """
+    Text lines inside ``box`` split into VALUE FRAGMENTS.
+
+    A fragment is a run of glyphs separated by whitespace — the atom of
+    table content.  Columns separate VALUES, and a value is never split
+    by whitespace, so fragment centres are the reliable assignment key:
+    a right-aligned "(1,586,319)" whose opening paren straddles the
+    column edge keeps its whole fragment together instead of bleeding
+    "(1,58" into the neighbour (clip and per-char assignment both fail
+    here — the paren glyph's centre sits 1.5 pt on the wrong side).
+    """
+    import bisect
+    raw = page.get_text("rawdict", clip=fitz.Rect(*box))
+    fragments: List[dict] = []
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            ly0, ly1 = line["bbox"][1], line["bbox"][3]
+            runs: List[List[dict]] = []
+            for span in line.get("spans", []):
+                skey = id(span)
+                for ch in span.get("chars", []):
+                    c = ch.get("c", "")
+                    if not c or c.isspace():
+                        continue
+                    bx = ch.get("bbox", (0, 0, 0, 0))
+                    if runs and bx[0] - runs[-1][-1][2] <= FRAG_GAP:
+                        runs[-1].append((bx[0], bx[1], bx[2], bx[3], c, skey))
+                    else:
+                        runs.append([(bx[0], bx[1], bx[2], bx[3], c, skey)])
+            for run in runs:
+                if not run:
+                    continue
+                fx0 = min(c[0] for c in run)
+                fx1 = max(c[2] for c in run)
+                text = "".join(c[4] for c in run)
+                skeys = {c[5] for c in run}
+                fragments.append({
+                    "y0": ly0, "y1": ly1, "x0": fx0, "x1": fx1,
+                    "cx": (fx0 + fx1) / 2.0, "cy": (ly0 + ly1) / 2.0,
+                    "text": text, "skeys": skeys,
+                })
+    fragments.sort(key=lambda f: (f["y0"], f["x0"]))
+    return fragments
+
+
+FRAG_GAP = 3.0         # inter-glyph gap that starts a new fragment (pt)
+SPAN_CELL_WIDTH = 1.5  # a fragment this many columns wide is a spanning
+                       # header cell, not column content
+
+
+def _cells_from_fragments(page: fitz.Page, box: Rect,
+                          row_edges: List[float], col_edges: List[float],
+                          keep_rows: Optional[List[int]] = None
+                          ) -> List[CellOutput]:
+    """
+    Build cells by assigning VALUE FRAGMENTS to the row/col interval
+    containing each fragment centre.
+
+    Header mode: a line carrying 1-2 fragments whose width blankets
+    several columns is a spanning disclosure header
+    （"截至或截止各年度12 月31 日" 通栏） — emitted as one cell with
+    col_span instead of being scattered per column.
+    """
+    import bisect
+    n_r, n_c = len(row_edges) - 1, len(col_edges) - 1
+    colw = (col_edges[-1] - col_edges[0]) / max(1, n_c)
+    keep = set(keep_rows) if keep_rows is not None else set(range(n_r))
+    frags = _line_fragments(page, box)
+
+    # group fragments per row interval (by fragment vertical centre)
+    by_row: dict = {}
+    for f in frags:
+        ri = min(max(bisect.bisect_right(row_edges, f["cy"]) - 1,
+                     0), n_r - 1)
+        by_row.setdefault(ri, []).append(f)
+
+    cells: List[CellOutput] = []
+    for ri in sorted(keep):
+        row_frags = sorted(by_row.get(ri, []), key=lambda f: (f["y0"], f["x0"]))
+        # merge same-column fragments from multiple lines (wrapped cells)
+        placed: dict = {}
+        order: List[tuple] = []
+        for f in row_frags:
+            ci = min(max(bisect.bisect_right(col_edges, f["cx"]) - 1,
+                         0), n_c - 1)
+            if ci not in placed:
+                placed[ci] = []
+                order.append((ci, f["y0"]))
+            placed[ci].append(f)
+        if not placed:
+            continue
+        # header mode: the whole row is 1-2 wide fragments
+        wide = [f for f in row_frags
+                if f["x1"] - f["x0"] >= SPAN_CELL_WIDTH * colw]
+        if len(row_frags) <= 2 and len(wide) == len(row_frags) and n_c >= 3:
+            f = row_frags[0]
+            c0 = min(max(bisect.bisect_right(col_edges, f["x0"]) - 1,
+                         0), n_c - 1)
+            c1 = min(max(bisect.bisect_right(col_edges, f["x1"]) - 1,
+                         0), n_c - 1)
+            if c1 > c0:
+                cells.append(CellOutput(
+                    text=f["text"], row=ri, col=c0,
+                    col_span=c1 - c0 + 1,
+                    bbox=(col_edges[c0], row_edges[ri],
+                          col_edges[c1 + 1], row_edges[ri + 1])))
+                continue
+        for ci, _ly in sorted(order):
+            fs = sorted(placed[ci], key=lambda f: (f["y0"], f["x0"]))
+            parts: List[str] = []
+            last_y = None
+            for f in fs:
+                if last_y is not None and f["y0"] - last_y > 3.0:
+                    parts.append("\n")
+                parts.append(f["text"])
+                last_y = f["y0"]
+            text = "".join(parts).strip()
+            if text:
+                cells.append(CellOutput(
+                    text=text,
+                    bbox=(col_edges[ci], row_edges[ri],
+                          col_edges[ci + 1], row_edges[ri + 1]),
+                    row=ri, col=ci,
+                ))
+    return cells
+
+
 def rebuild_grid(page: fitz.Page, box: Rect,
                  col_edges: Optional[List[float]] = None,
                  src_cols: Optional[int] = None,
@@ -432,7 +560,8 @@ def rebuild_grid(page: fitz.Page, box: Rect,
             best_name, best_rate, edges = name, rate, cand
     n_cols = len(edges) - 1
     rules = _ruled_row_edges(page, box)
-    intervals = None
+    row_edges = None
+    keep_rows = None
     if rules:
         cand = [(a, b) for a, b in zip(rules, rules[1:]) if b - a >= 4.0]
         # Density guard: hybrid tables (ruled head, wireless tail held
@@ -442,7 +571,11 @@ def rebuild_grid(page: fitz.Page, box: Rect,
         if len(cand) >= 0.8 * len(rows):
             intervals = cand
             n_rows = len(intervals)
-    if intervals is None:
+            # assignment runs over the FULL rule set; only kept intervals
+            # emit cells (double-rule slivers hold no text)
+            row_edges = rules
+            keep_rows = [rules.index(a) for a, _b in intervals]
+    if row_edges is None:
         # y boundaries: bbox top, then band midpoints, then bbox bottom
         yb = [box[1]]
         for a, b in zip(rows, rows[1:]):
@@ -450,16 +583,14 @@ def rebuild_grid(page: fitz.Page, box: Rect,
         yb.append(box[3])
         intervals = list(zip(yb, yb[1:]))
         n_rows = len(rows)
-    cells: List[CellOutput] = []
-    for ri, (ry0, ry1) in enumerate(intervals):
-        for ci in range(n_cols):
-            rect = fitz.Rect(edges[ci], ry0, edges[ci + 1], ry1)
-            txt = page.get_text("text", clip=rect).strip()
-            if txt:
-                cells.append(CellOutput(
-                    text=txt, bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                    row=ri, col=ci,
-                ))
+        row_edges = yb
+    cells = _cells_from_fragments(page, box, row_edges, edges,
+                              keep_rows=keep_rows)
+    if keep_rows is not None:
+        # re-index rows from the full rule set down to the kept intervals
+        remap = {old: new for new, old in enumerate(sorted(keep_rows))}
+        for c in cells:
+            c.row = remap.get(c.row, c.row)
     return cells, n_rows, n_cols, edges, rows
 
 
