@@ -197,13 +197,20 @@ def _table_top(table: TableOutput) -> float:
 
 def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
     """
-    True when a text block is table cell content: cells of one table
-    cover >=50% of the block.  Coverage accumulates over the table's
-    cells because PyMuPDF often packs a whole table (or a wide span of
-    rows) into ONE text block — per-cell tests would then see only a
-    small fraction each and the block would leak as prose.  Scope labels
-    and captions absorbed into a table's detection box sit above the
-    cells, so they survive and keep their reading-order slot.
+    True when a text block is table cell content.  Two tests:
+
+    per-cell coverage (any table): cells of one table cover >=50% of the
+    block.  Coverage accumulates over the table's cells because PyMuPDF
+    often packs a whole table into ONE text block — per-cell tests alone
+    would see only a small fraction each.
+
+    grid-extent containment (rebuilt tables only): a completed grid tiles
+    its whole region, so ANY block inside the grid extent is table
+    content.  PyMuPDF groups section-label rows（"归属于："）into
+    full-row-width blocks whose overlap with the single label cell is
+    only ~25% — per-cell coverage lets them leak and they reappear after
+    the table in reading order.  For rebuilt grids the leak is
+    impossible: nothing inside the grid is anything but table content.
     """
     bx0, by0, bx1, by1 = text.bbox
     if bx1 <= bx0 or by1 <= by0:
@@ -211,10 +218,16 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
     barea = (bx1 - bx0) * (by1 - by0)
     for table in tables:
         inter = 0.0
+        gx0 = gy0 = gx1 = gy1 = None
         for c in table.cells:
             r = c.bbox
             if r[2] <= r[0] or r[3] <= r[1]:
                 continue
+            if gx0 is None:
+                gx0, gy0, gx1, gy1 = r
+            else:
+                gx0, gy0 = min(gx0, r[0]), min(gy0, r[1])
+                gx1, gy1 = max(gx1, r[2]), max(gy1, r[3])
             ix0, iy0 = max(bx0, r[0]), max(by0, r[1])
             ix1, iy1 = min(bx1, r[2]), min(by1, r[3])
             if ix1 <= ix0 or iy1 <= iy0:
@@ -222,6 +235,12 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
             inter += (ix1 - ix0) * (iy1 - iy0)
         if inter >= 0.5 * barea:
             return True
+        if table.completed and gx0 is not None:
+            ix0, iy0 = max(bx0, gx0), max(by0, gy0)
+            ix1, iy1 = min(bx1, gx1), min(by1, gy1)
+            if ix1 > ix0 and iy1 > iy0 \
+                    and (ix1 - ix0) * (iy1 - iy0) >= 0.5 * barea:
+                return True
     return False
 
 
