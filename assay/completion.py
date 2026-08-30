@@ -594,6 +594,32 @@ def rebuild_grid(page: fitz.Page, box: Rect,
     return cells, n_rows, n_cols, edges, rows
 
 
+# ── Numeric coverage ──────────────────────────────────────────────────────
+
+NUM_TOKEN = re.compile(r'\d[\d,，.]*\d|\d')
+
+
+def _numeric_gap(page: fitz.Page, table_bbox: Rect,
+                 cells: List[CellOutput]) -> int:
+    """
+    Count numeric tokens of the region text that are absent from the
+    cells' text (comma/space-insensitive substring test).  SLANet cell
+    bboxes sometimes amputate the last glyph of a right-aligned value
+    ('25,688' → '25,68') — one or two chars below the uncovered-text
+    ratio trigger, but fatal for a financial corpus.
+    """
+    text = "".join(c.text for c in cells).replace(",", "").replace(" ", "")
+    region = page.get_text("text", clip=fitz.Rect(*table_bbox))
+    missing = 0
+    for tok in NUM_TOKEN.findall(region):
+        v = tok.replace(",", "").replace(" ", "")
+        if len(v) < 3 or re.fullmatch(r"(19|20)\d{2}", v):
+            continue
+        if v not in text:
+            missing += 1
+    return missing
+
+
 # ── Public entry ──────────────────────────────────────────────────────────
 
 
@@ -604,15 +630,19 @@ def complete_table(page: fitz.Page,
                    num_cols: int,
                    ) -> Tuple[List[CellOutput], int, int, bool]:
     """
-    Replace an under-segmented / misaligned SLANet grid with a geometric
-    rebuild when a trigger fires and the rebuild's text recall is no
-    worse.  Triggers: uncovered region text (under-segmentation) or
-    structure misalignment (cells fusing two text rows).
+    Replace an under-segmented / misaligned / incomplete SLANet grid with
+    a geometric rebuild when a trigger fires and the rebuild's text
+    recall is no worse.  Triggers: uncovered region text
+    (under-segmentation), structure misalignment (cells fusing two text
+    rows or slicing through them), numeric gap (region numeric tokens
+    absent from the cells — SLANet cell-edge truncation).
 
     Returns (cells, num_rows, num_cols, replaced).
     """
     if not (needs_completion(page, table_bbox, cells)
-            or structure_suspect(page, table_bbox, cells)):
+            or structure_suspect(page, table_bbox, cells)
+            or (table_bbox is not None and cells
+                and _numeric_gap(page, table_bbox, cells) > 0)):
         return cells, num_rows, num_cols, False
 
     new_cells, new_rows, new_cols, new_edges, rows = rebuild_grid(
