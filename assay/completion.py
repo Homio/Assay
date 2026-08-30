@@ -51,6 +51,7 @@ from typing import List, Optional, Tuple
 import fitz
 
 from assay.output import CellOutput
+from assay.rulings import extract_line_segments
 from assay.splitting import (
     TEXT_TABLE_GUTTER,
     _colrow_ok,
@@ -136,6 +137,54 @@ def needs_completion(page: fitz.Page, table_bbox: Optional[Rect],
             and uncovered / total >= MIN_UNCOVERED_FRAC)
 
 
+# ── Structure misalignment ────────────────────────────────────────────────
+
+STRADDLE_MIN = 3       # fewer suspect cells than this is wrap noise
+STRADDLE_RATIO = 0.15  # ... or under this share of the grid's cells
+CUT_RATIO = 0.20       # share of cell edges allowed to slice a text row
+
+
+def structure_suspect(page: fitz.Page, table_bbox: Optional[Rect],
+                      cells: List[CellOutput]) -> bool:
+    """
+    True when SLANet's row edges have drifted off the text rows.
+
+    Two drift morphologies, both centered on MULTI-SPAN text rows
+    (prose lines are single-span and never count):
+
+      straddling cells — a cell spans the centres of >=2 text rows
+      （分部表 after a wrapped header: two rows' labels fused in one
+      cell, two rows' values in the next);
+
+      edge-cutting — a half-row offset keeps every cell holding one
+      row centre while its edges slice THROUGH neighbouring text rows
+      （中国石油 IFRS 摘要表： "所得税费用 净利润" fused, each cell
+      containing exactly one centre).  A healthy grid puts its edges in
+      the whitespace between rows, so the cut ratio is ~0.
+    """
+    if table_bbox is None or not cells:
+        return False
+    bands = [(y0, y1) for y0, y1, spans in _rows(page, table_bbox)
+             if len(spans) >= 2 and y1 - y0 > 3.0]
+    valid = [c for c in cells
+             if c.bbox[2] > c.bbox[0] and c.bbox[3] > c.bbox[1]]
+    if len(bands) < 3 or not valid:
+        return False
+    centres = [(y0 + y1) / 2 for y0, y1 in bands]
+    straddle = sum(
+        1 for c in valid
+        if sum(1 for cy in centres if c.bbox[1] < cy < c.bbox[3]) >= 2)
+    if straddle >= max(STRADDLE_MIN, STRADDLE_RATIO * len(valid)):
+        return True
+    cut = 0
+    for c in valid:
+        for e in (c.bbox[1], c.bbox[3]):
+            if any(y0 + 1.0 < e < y1 - 1.0 for y0, y1 in bands):
+                cut += 1
+                break
+    return cut >= max(6, CUT_RATIO * len(valid))
+
+
 # ── Geometric rebuild ─────────────────────────────────────────────────────
 
 
@@ -204,40 +253,214 @@ def _grid_col_edges(cells: List[CellOutput]) -> List[float]:
     return merged
 
 
-def rebuild_grid(page: fitz.Page, box: Rect
+def _ruled_row_edges(page: fitz.Page, box: Rect) -> List[float]:
+    """
+    Horizontal row rules inside ``box`` — a framed table's row
+    boundaries, exact regardless of wrapped cells.
+
+    Row rules are often drawn in SEGMENTS per column block (4 segments
+    per rule on the 中国石油 分部表), so lines are grouped by y and the
+    union coverage of each y-band decides — no single segment needs to
+    span the width.
+    """
+    H, _V = extract_line_segments(page)
+    width = box[2] - box[0]
+    by_y: dict = {}
+    for h0, h1, hy in H:
+        if box[1] - 2.0 <= hy <= box[3] + 2.0:
+            by_y.setdefault(round(hy / 2.0), []).append(
+                (max(h0, box[0]), min(h1, box[2])))
+    rules: List[float] = []
+    for key in sorted(by_y):
+        segs = sorted(by_y[key])
+        cov, cur_end = 0.0, None
+        for a, b in segs:
+            if cur_end is None or a > cur_end:
+                cov += b - a
+                cur_end = b
+            elif b > cur_end:
+                cov += b - cur_end
+                cur_end = b
+        if cov >= 0.6 * width:
+            rules.append(key * 2.0)
+    merged: List[float] = []
+    for y in rules:
+        if not merged or y - merged[-1] > 2.0:
+            merged.append(y)
+    if len(merged) < 3 or merged[0] > box[1] + 8.0 or merged[-1] < box[3] - 8.0:
+        return []          # rules do not structure the whole region
+    return merged
+
+
+def _consolidate_col_edges(edges: List[float], src_cols: int) -> List[float]:
+    """
+    Consolidate a drifted grid's scattered column edges back to
+    ``src_cols + 1`` boundaries.
+
+    When row edges drift, SLANet's cell x-edges scatter around each true
+    boundary (中国石油 分部表: 28 fragments over 8 boundaries).  The
+    inter-column gaps are then the widest whitespace runs in the edge
+    set, so repeatedly merging the closest pair until only
+    ``src_cols + 1`` edges remain collapses each fragment cluster onto
+    its boundary mean.  Only runs when fragments exceed the grid's own
+    column count — a healthy grid's edges pass through untouched.
+    """
+    target = src_cols + 1
+    es = sorted(edges)
+    if len(es) <= target:
+        return es
+    while len(es) > target:
+        gaps = [b - a for a, b in zip(es, es[1:])]
+        j = gaps.index(min(gaps))
+        es[j:j + 2] = [(es[j] + es[j + 1]) / 2]
+    return es
+
+
+def _span_crossing_rate(bands: list, edges: List[float]) -> float:
+    """Share of text spans sliced by an interior candidate column edge —
+    a sound column boundary falls in the whitespace between spans, so
+    the lower the crossing rate, the better the edge set explains the
+    text layout."""
+    interior = edges[1:-1]
+    if not interior:
+        return 0.0
+    total = bad = 0
+    for _y0, _y1, spans in bands:
+        for x0, x1, _t in spans:
+            total += 1
+            if any(x0 + 1.0 < e < x1 - 1.0 for e in interior):
+                bad += 1
+    return bad / total if total else 0.0
+
+
+MIDPOINT_TOL = 10.0     # clustering tolerance for span-gap midpoints (pt)
+MIDPOINT_ROWS = 0.35    # a boundary needs this share of multi-span rows
+
+
+def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
+    """
+    Column boundaries voted by the rows themselves: every multi-span row
+    contributes the midpoints between its adjacent spans, and boundaries
+    are the clusters confirmed by enough rows.  Numeric tables
+    right-align their values, so span LEFT edges wander while the gaps
+    between columns stay put — the gap midpoint is the stable feature
+    （中国石油 IFRS 摘要表： boundaries vote at ~348/395/441/490 across
+    26 rows where SLANet's drifted edges slice the values）.
+    """
+    votes: List[float] = []
+    n_multi = 0
+    for _y0, _y1, spans in rows:
+        if len(spans) < 2:
+            continue
+        n_multi += 1
+        for a, b in zip(spans, spans[1:]):
+            votes.append((a[1] + b[0]) / 2)
+    if not votes or n_multi < 3:
+        return []
+    votes.sort()
+    need = MIDPOINT_ROWS * n_multi
+    clusters: List[List[float]] = []
+    for v in votes:
+        if clusters and v - clusters[-1][-1] <= MIDPOINT_TOL:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    out = [sum(c) / len(c) for c in clusters if len(c) >= need]
+    return [box[0]] + out + [box[2]] if out else []
+
+
+def rebuild_grid(page: fitz.Page, box: Rect,
+                 col_edges: Optional[List[float]] = None,
+                 src_cols: Optional[int] = None,
                  ) -> Tuple[List[CellOutput], int, int, List[float], list]:
     """
-    Re-segment the table region into a row x column grid from text-line
-    and gutter geometry alone.
+    Re-segment the table region into a row x column grid from geometry
+    alone (drawn rules + text lines + gutter evidence).
 
-    Row cells tile the full region vertically (boundaries at inter-band
-    midpoints, outer edges at the bbox) the way a drawn grid would — text
-    assignment is unchanged (boundaries fall in whitespace) and the grid
-    honestly covers the whole table.
+    Row boundaries: drawn full-width rules when they structure the whole
+    region — a ruled table's rules are the exact row edges, immune to the
+    wrapped 2-line cells that split text bands.  Otherwise text-band
+    midpoints.
+
+    Columns: two candidates compete — the existing grid's own x-edges
+    (consolidated to the grid's column count) and span-gap gutters — and
+    the span-crossing rate picks the winner: a sound column boundary
+    falls in the whitespace between text spans, so drifted SLANet edges
+    that slice through spans lose to the gutters, and vice versa.
 
     Returns (cells, num_rows, num_cols, col_edges, rows).
     """
     rows = _rows(page, box)
     if not rows:
         return [], 0, 0, [box[0], box[2]], []
-    edges = _column_edges(rows, box[0], box[2])
+
+    def _clamp(es: List[float]) -> List[float]:
+        # Clamp (never drop) edges into the box: SLANet cells legitimately
+        # overhang the detection box by a few pt, and dropping the outermost
+        # edge amputates the whole label column (中国石油 分部表).
+        es = sorted({min(max(e, box[0]), box[2]) for e in es})
+        return es if len(es) >= 2 else [box[0], box[2]]
+
+    cand_hint = cand_gutter = cand_mid = None
+    if col_edges and len(col_edges) >= 2:
+        cand_hint = _clamp(col_edges)
+        if src_cols is not None:
+            cand_hint = _consolidate_col_edges(cand_hint, src_cols)
+    cand_gutter = _clamp(_column_edges(rows, box[0], box[2]))
+    cand_mid = _clamp(_span_midpoint_edges(rows, box))
+
+    cands = [("hint", cand_hint), ("gutter", cand_gutter),
+             ("midpoint", cand_mid)]
+    cands = [(n, c) for n, c in cands if c]
+    # Structure sufficiency: a candidate too poor to separate the columns
+    # of a typical row (2-column degenerate gutter fits) trivially scores
+    # zero crossings and must not compete — require interior edges >= the
+    # median spans per multi-span row minus one.
+    span_counts = sorted(len(spans) for _y, _y2, spans in rows
+                         if len(spans) >= 2)
+    min_interior = max(1, (span_counts[len(span_counts) // 2] - 1)) \
+        if span_counts else 1
+    cands = [(n, c) for n, c in cands
+             if len(c) - 2 >= min_interior]
+    if not cands:
+        cands = [("gutter", cand_gutter)]
+    best_name, edges = cands[0]
+    best_rate = _span_crossing_rate(rows, edges)
+    for name, cand in cands[1:]:
+        rate = _span_crossing_rate(rows, cand)
+        if rate < best_rate - 1e-9:
+            best_name, best_rate, edges = name, rate, cand
     n_cols = len(edges) - 1
-    # y boundaries: bbox top, then band midpoints, then bbox bottom
-    yb = [box[1]]
-    for a, b in zip(rows, rows[1:]):
-        yb.append((a[1] + b[0]) / 2)
-    yb.append(box[3])
+    rules = _ruled_row_edges(page, box)
+    intervals = None
+    if rules:
+        cand = [(a, b) for a, b in zip(rules, rules[1:]) if b - a >= 4.0]
+        # Density guard: hybrid tables (ruled head, wireless tail held
+        # together by subtotal double-rules) yield sparse rule intervals
+        # that would fuse many text rows per cell.  Rules win only when
+        # they structure at least 80% of the text rows.
+        if len(cand) >= 0.8 * len(rows):
+            intervals = cand
+            n_rows = len(intervals)
+    if intervals is None:
+        # y boundaries: bbox top, then band midpoints, then bbox bottom
+        yb = [box[1]]
+        for a, b in zip(rows, rows[1:]):
+            yb.append((a[1] + b[0]) / 2)
+        yb.append(box[3])
+        intervals = list(zip(yb, yb[1:]))
+        n_rows = len(rows)
     cells: List[CellOutput] = []
-    for ri in range(len(rows)):
+    for ri, (ry0, ry1) in enumerate(intervals):
         for ci in range(n_cols):
-            rect = fitz.Rect(edges[ci], yb[ri], edges[ci + 1], yb[ri + 1])
+            rect = fitz.Rect(edges[ci], ry0, edges[ci + 1], ry1)
             txt = page.get_text("text", clip=rect).strip()
             if txt:
                 cells.append(CellOutput(
                     text=txt, bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
                     row=ri, col=ci,
                 ))
-    return cells, len(rows), n_cols, edges, rows
+    return cells, n_rows, n_cols, edges, rows
 
 
 # ── Public entry ──────────────────────────────────────────────────────────
@@ -250,16 +473,20 @@ def complete_table(page: fitz.Page,
                    num_cols: int,
                    ) -> Tuple[List[CellOutput], int, int, bool]:
     """
-    Replace an under-segmented SLANet grid with a geometric rebuild when
-    the trigger fires and the rebuild's text recall is no worse.
+    Replace an under-segmented / misaligned SLANet grid with a geometric
+    rebuild when a trigger fires and the rebuild's text recall is no
+    worse.  Triggers: uncovered region text (under-segmentation) or
+    structure misalignment (cells fusing two text rows).
 
     Returns (cells, num_rows, num_cols, replaced).
     """
-    if not needs_completion(page, table_bbox, cells):
+    if not (needs_completion(page, table_bbox, cells)
+            or structure_suspect(page, table_bbox, cells)):
         return cells, num_rows, num_cols, False
 
     new_cells, new_rows, new_cols, new_edges, rows = rebuild_grid(
-        page, table_bbox)
+        page, table_bbox, col_edges=_grid_col_edges(cells),
+        src_cols=num_cols)
     if not new_cells:
         return cells, num_rows, num_cols, False
 
