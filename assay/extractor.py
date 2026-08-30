@@ -190,51 +190,44 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
     lines = [l for l in lines
              if not re.match(r'^[-·•—–\s]*\d{1,3}\s*[-—]?\s*$', l["text"])]
 
-    # body margin: the LEFTMOST x0 cluster (3pt tolerance) — 正文边距就
-    # 是页面上最左的稳定文本位置，段首缩进（+2em）永远在它右侧。
-    # 注意不能用"最大簇"：附注页段落多而短，缩进行（段首）会比
-    # 续行（齐左）更频繁，最大簇会选中缩进位而非边距位。
-    min_x0 = min(l["x0"] for l in lines)
-    near_left = sorted(l["x0"] for l in lines if l["x0"] <= min_x0 + 30)
-    clusters: List[List[float]] = []
-    for x in near_left:
-        if clusters and x - clusters[-1][-1] <= 3.0:
-            clusters[-1].append(x)
-        else:
-            clusters.append([x])
-    leftmost = min(clusters, key=lambda c: c[0])
-    base_x = sum(leftmost) / len(leftmost)
-    # em width ≈ median per-character advance of body lines
+    # em width ≈ median per-character advance (for the indent-shift test)
     advs = sorted((l["x1"] - l["x0"]) / len(l["text"]) for l in lines
                   if len(l["text"]) >= 4)
     em = advs[len(advs) // 2] if advs else 12.0
-    indent_lo, indent_hi = base_x + 1.2 * em, base_x + 3.2 * em
 
-    # walk top-down: indented line starts a paragraph; flush lines merge
+    # walk top-down with the RELATIVE-SHIFT paragraph rule: a line is a
+    # NEW paragraph iff it is indented ~+2em RELATIVE TO THE PREVIOUS
+    # LINE (段首缩进签名); flush or left-shifted lines are continuations.
+    # 参与约束：只有以通栏行（≥55% 页宽）开头的块能吸收续行——表格
+    # 行碎片是窄行/共享行 y，永不参与合并；块首非通栏（表格碎片、
+    # 短标签）也永不吸收。
+    from collections import Counter
+    ybucket = Counter(round(l["y0"] / 2.0) for l in lines)
+    page_w = page.rect.width
+
     paragraphs: List[List[dict]] = []
     cur: List[dict] = []
+    prev_x0 = None
     for l in lines:
-        indented = indent_lo <= l["x0"] <= indent_hi
-        flush = abs(l["x0"] - base_x) <= 3.0
+        row_frag = ybucket[round(l["y0"] / 2.0)] >= 2
+        shift = (l["x0"] - prev_x0) if prev_x0 is not None else None
+        new_para = shift is not None and 1.2 * em <= shift <= 3.2 * em
         cur_text = "".join(x["text"] for x in cur).strip()
         cur_size = cur[-1]["size"] if cur else 0.0
-        cur_anchor = cur[0]["x0"] if cur else 0.0
+        cur_starts_wide = cur and (cur[0]["x1"] - cur[0]["x0"]) >= 0.55 * page_w
         # merge guards: size change (heading vs body), introductory
-        # colon（"各位股东："）, dot-leader lines（目录条目）, and
-        # anchor position — only body-anchored blocks（边距~缩进区）
-        # absorb flush continuations; embedded table cell blocks
-        # （锚在表格列位）must not swallow body-margin lines
+        # colon（"各位股东："）, and dot-leader lines（目录条目）
         same_style = cur and abs(cur_size - l["size"]) <= 1.0
         intro_colon = cur_text.endswith("：") or cur_text.endswith(":")
         dot_leader = "...." in l["text"] or "····" in l["text"]
-        anchor_ok = base_x - 3.0 <= cur_anchor <= indent_hi
-        if cur and not indented and flush and same_style \
-                and not intro_colon and not dot_leader and anchor_ok:
+        if cur and cur_starts_wide and not row_frag and not new_para \
+                and same_style and not intro_colon and not dot_leader:
             cur.append(l)               # continuation line
         else:
             if cur:
                 paragraphs.append(cur)
             cur = [l]
+        prev_x0 = l["x0"]
     if cur:
         paragraphs.append(cur)
 
