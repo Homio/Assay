@@ -501,6 +501,38 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
 
 WRAP_FILL = 0.85       # 折行首行顶满标签列宽度的比例阈值
 WRAP_LEFT_TOL = 15.0   # 续行起始 x 与标签列左缘的容差（pt）
+_WRAP_COMPLETE_END = re.compile(r'[：:；;。．）)％%]$|\d$|\d\s*日$')
+_WRAP_ENUM_PREFIX = (
+    re.compile(r'^[（(]?\d{1,3}[.、)）．]\s*\S'),          # 1. / (3) / （2）、
+    re.compile(r'^[（(]?[一二三四五六七八九十]{1,3}[)）、.．]\s*\S'),  # 一、/（一）
+    re.compile(r'^\(?[ivxIVXa-zA-Z]{1,4}[.、)）]\s*\S'),   # (a) / iv.
+    re.compile(r'^[•·●▪◦‣■○–─-]\s*\S'),                   # bullets
+    re.compile(r'^[①-⑳㉑-㉟]\s*\S'),                        # circled
+)
+
+
+def _wrap_veto(t1: str, t2: str) -> bool:
+    """
+    结构性标签否决：几何四条件无法区分"折行标签"与"独立结构行 +
+    数据行"时，靠文字收尾特征裁决。
+
+    首行以冒号/句号/右括号/百分号/数字/日期（"…12 月31 日"）收尾，
+    首行或次行以枚举头（"一、"/"1."/"(a)"/"①"）起始 → 首行是完整
+    的结构性标签（"2024 年12 月31 日"、"其中："、"一、合营企业"），
+    独立成行，否决合并。折行标签（"…扣除非经"）不带任何收尾特征，
+    不触发否决。
+    """
+    t1 = (t1 or '').strip()
+    t2 = (t2 or '').strip()
+    if not t1 or not t2:
+        return True
+    if _WRAP_COMPLETE_END.search(t1):
+        return True
+    if any(rx.match(t1) or rx.match(t2) for rx in _WRAP_ENUM_PREFIX):
+        return True
+    if re.match(r'^[（(]?\d', t2):
+        return True
+    return False
 
 
 def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
@@ -509,15 +541,21 @@ def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
     数值与标签末行底部对齐时，文本带把一行拆成两行——首行只有标签
     前半（值列全空）、次行是标签后半 + 全部数值。
 
-    合并判据（四条同时成立，缺一不并——这就是防打地鼠的约束）：
+    合并判据 = 几何四条件 AND 无结构否决：
+
+    几何（同时成立）：
       1. 首行所有片段都在标签列 x 范围内（值列无墨迹）；
       2. 首行最右墨迹顶到标签列宽度的 85% 以上——折行的原因就是
-         顶边，分节行（"归属于："、"一、合营企业"）都是短标签，
-         到不了这条线；
-      3. 次行带数值片段（值在次行 = 数值与标签末行底部对齐的签名）；
+         顶边；
+      3. 次行带数值片段（数值与标签末行底部对齐的签名）；
       4. 次行最左片段从标签列左缘接排（续行接排）。
-    连锁吸收：三行折行依次并入。规则路径不受影响（有行线的表由
-    横线定行，折行单元格天然保住）。
+
+    结构否决（_wrap_veto）：首行以冒号/括号/百分号/数字/日期收尾、
+    或次行以枚举头起始 → 首行是完整的结构性标签，独立成行，不并。
+    这是对"首行顶满但真是独立行"这一反例的正面回答：此类行几乎
+    总带收尾特征或枚举头；两者皆无的长平文本行，统计上属于折行。
+
+    连锁吸收支持三行折行。规则路径不受影响（有行线的表由横线定行）。
     """
     if len(edges) < 3 or len(rows) < 2:
         return rows
@@ -543,7 +581,10 @@ def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
         while (j < len(rows)
                and label_only_fills(cur)
                and has_value_frags(rows[j])
-               and min(x0 for x0, x1, _t in rows[j][2]) <= lx0 + WRAP_LEFT_TOL):
+               and min(x0 for x0, x1, _t in rows[j][2]) <= lx0 + WRAP_LEFT_TOL
+               and not _wrap_veto(
+                   ''.join(s[2] for s in sorted(cur[2])),
+                   min(rows[j][2], key=lambda s: s[0])[2])):
             cur = [min(cur[0], rows[j][0]), max(cur[1], rows[j][1]),
                    sorted(cur[2] + rows[j][2], key=lambda s: (s[0], s[1]))]
             j += 1
