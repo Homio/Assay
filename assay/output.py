@@ -11,6 +11,7 @@ Coordinate system: all bbox values are in PDF points (native PDF units).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -197,7 +198,7 @@ def _table_top(table: TableOutput) -> float:
 
 def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
     """
-    True when a text block is table cell content.  Two tests:
+    True when a text block is table cell content.  Four tests:
 
     per-cell coverage (any table): cells of one table cover >=50% of the
     block.  Coverage accumulates over the table's cells because PyMuPDF
@@ -211,11 +212,20 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
     only ~25% — per-cell coverage lets them leak and they reappear after
     the table in reading order.  For rebuilt grids the leak is
     impossible: nothing inside the grid is anything but table content.
+
+    detection-box containment (any table): a block almost fully inside
+    the detection bbox is table content even when SLANet cells missed it
+    —— SLANet 漏格不会让内容搬出表格区域，留在区域内的只会是重复泄漏。
+
+    duplicate content (any table): 表后成段重复的行标签/整列数值
+    （"预付款项/减：减值准备"、"H 股 21,099 …"）——块文本完整出现在
+    该表单元格文本中、且紧贴表底（泄漏总在阅读顺序的表后）→ 过滤。
     """
     bx0, by0, bx1, by1 = text.bbox
     if bx1 <= bx0 or by1 <= by0:
         return False
     barea = (bx1 - bx0) * (by1 - by0)
+    bn = re.sub(r"\s+", "", text.text)
     for table in tables:
         inter = 0.0
         gx0 = gy0 = gx1 = gy1 = None
@@ -241,6 +251,22 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
             if ix1 > ix0 and iy1 > iy0 \
                     and (ix1 - ix0) * (iy1 - iy0) >= 0.5 * barea:
                 return True
+        tb = table.table_bbox
+        if tb and tb[2] > tb[0] and tb[3] > tb[1]:
+            ix0, iy0 = max(bx0, tb[0]), max(by0, tb[1])
+            ix1, iy1 = min(bx1, tb[2]), min(by1, tb[3])
+            if ix1 > ix0 and iy1 > iy0 \
+                    and (ix1 - ix0) * (iy1 - iy0) >= 0.9 * barea:
+                return True
+            if bn and len(bn) >= 2 and by0 >= tb[3] - 5.0 \
+                    and by0 <= tb[3] + 60.0:
+                cached = getattr(table, "_norm_cells_cache", None)
+                if cached is None:
+                    cached = re.sub(r"\s+", "",
+                                    "".join(c.text for c in table.cells))
+                    table._norm_cells_cache = cached
+                if bn in cached:
+                    return True
     return False
 
 

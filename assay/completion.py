@@ -139,7 +139,7 @@ def needs_completion(page: fitz.Page, table_bbox: Optional[Rect],
 
 # ── Structure misalignment ────────────────────────────────────────────────
 
-STRADDLE_MIN = 3       # fewer suspect cells than this is wrap noise
+STRADDLE_MIN = 2       # fewer suspect cells than this is wrap noise
 STRADDLE_RATIO = 0.15  # ... or under this share of the grid's cells
 CUT_RATIO = 0.20       # share of cell edges allowed to slice a text row
 
@@ -182,7 +182,45 @@ def structure_suspect(page: fitz.Page, table_bbox: Optional[Rect],
             if any(y0 + 1.0 < e < y1 - 1.0 for y0, y1 in bands):
                 cut += 1
                 break
-    return cut >= max(6, CUT_RATIO * len(valid))
+    if cut >= max(6, CUT_RATIO * len(valid)):
+        return True
+    return _column_cut(page, table_bbox, valid) >= 1
+
+
+def _column_cut(page: fitz.Page, table_bbox: Rect,
+                cells: List[CellOutput]) -> int:
+    """
+    列向错位签名：网格内部列边界切进文字**片段**（片段 = 空白分隔的
+    文字原子，FRAG_GAP 分割）。真列界两侧有 ≥4pt 的单元格留白，绝不
+    会切进片段；切进片段的边界只可能是——
+
+      · 混排字体的行内空格被当成列界（日期表头 "2024 年12 月31 日"
+        被劈成 "2024" + "年12 月31 日"，并繁殖整列空列）；
+      · SLANet 把通栏之外的窄间隙当成了界。
+
+    通栏表头（≥1.5 倍平均列宽的片段）是合法跨越，不计。任一切割即
+    触发重建。
+    """
+    if table_bbox is None or not cells:
+        return 0
+    xs = [v for c in cells if c.bbox[2] > c.bbox[0]
+          for v in (c.bbox[0], c.bbox[2])]
+    if len(xs) < 4:
+        return 0
+    edges = sorted(set(xs))
+    interior = edges[1:-1]
+    if not interior:
+        return 0
+    gx0, gx1 = edges[0], edges[-1]
+    colw = (gx1 - gx0) / max(1, len(edges) - 1)
+    frags = _line_fragments(page, table_bbox)
+    n = 0
+    for f in frags:
+        if f["x1"] - f["x0"] >= SPAN_CELL_WIDTH * colw:
+            continue
+        if any(f["x0"] + 0.5 < e < f["x1"] - 0.5 for e in interior):
+            n += 1
+    return n
 
 
 # ── Geometric rebuild ─────────────────────────────────────────────────────
@@ -335,6 +373,7 @@ def _span_crossing_rate(bands: list, edges: List[float]) -> float:
 
 MIDPOINT_TOL = 10.0     # clustering tolerance for span-gap midpoints (pt)
 MIDPOINT_ROWS = 0.35    # a boundary needs this share of multi-span rows
+MIDPOINT_MIN_GAP = 4.0  # 混排字体行内空格（2-3pt）不是列界（pt）
 
 
 def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
@@ -346,6 +385,11 @@ def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
     between columns stay put — the gap midpoint is the stable feature
     （中国石油 IFRS 摘要表： boundaries vote at ~348/395/441/490 across
     26 rows where SLANet's drifted edges slice the values）.
+
+    投票纪律：候选间隙必须 ≥ MIDPOINT_MIN_GAP——列内混排字体的空格
+    （"2024 年12 月31 日" 的数字/汉字间距 2-3pt）绝不是列界，小表
+    （n_multi 少）里单行空格投票曾把日期表头劈成 "2024"+"年12 月31 日"
+    两格并繁殖整列空列。确认票数下限 2——单行投票不足以立界。
     """
     votes: List[float] = []
     n_multi = 0
@@ -354,11 +398,12 @@ def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
             continue
         n_multi += 1
         for a, b in zip(spans, spans[1:]):
-            votes.append((a[1] + b[0]) / 2)
+            if b[0] - a[1] >= MIDPOINT_MIN_GAP:
+                votes.append((a[1] + b[0]) / 2)
     if not votes or n_multi < 3:
         return []
     votes.sort()
-    need = MIDPOINT_ROWS * n_multi
+    need = max(2, MIDPOINT_ROWS * n_multi)
     clusters: List[List[float]] = []
     for v in votes:
         if clusters and v - clusters[-1][-1] <= MIDPOINT_TOL:
@@ -382,7 +427,11 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
     here — the paren glyph's centre sits 1.5 pt on the wrong side).
     """
     import bisect
-    raw = page.get_text("rawdict", clip=fitz.Rect(*box))
+    # clip 四周外扩 4pt：检测框贴着边线，最后一列/最后一行的字形
+    # （"…人民币" 的 "币"）可能压线——clip 会把压线字形整体丢弃，
+    # 造成格尾截断。外扩只影响字形采集，行列归属仍由格心决定
+    clip = fitz.Rect(box[0] - 4.0, box[1] - 4.0, box[2] + 4.0, box[3] + 4.0)
+    raw = page.get_text("rawdict", clip=clip)
     fragments: List[dict] = []
     for block in raw.get("blocks", []):
         for line in block.get("lines", []):
@@ -404,7 +453,15 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
                     continue
                 fx0 = min(c[0] for c in run)
                 fx1 = max(c[2] for c in run)
-                text = "".join(c[4] for c in run)
+                # 片段文本保留词间空隙（>1.2pt）："Mangistau Investment
+                # B.V." 不能连写成 "MangistauInvestmentB.V."
+                text = ""
+                prev_x1 = None
+                for c in run:
+                    if prev_x1 is not None and c[0] - prev_x1 > 1.2:
+                        text += " "
+                    text += c[4]
+                    prev_x1 = c[2]
                 skeys = {c[5] for c in run}
                 fragments.append({
                     "y0": ly0, "y1": ly1, "x0": fx0, "x1": fx1,
@@ -422,6 +479,7 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
 
 
 FRAG_GAP = 3.0         # inter-glyph gap that starts a new fragment (pt)
+GAPVOTE_MIN_GAP = 4.0  # 补边投票的最小片段间隙（pt）——行内空格不是列界
 SPAN_CELL_WIDTH = 1.5  # a fragment this many columns wide is a spanning
                        # header cell, not column content
 
@@ -456,24 +514,66 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
         return min(max(bisect.bisect_right(col_edges, x) - 1, 0), n_c - 1)
 
     def _split_fragment(f: dict) -> List[tuple]:
-        """Split a cross-column fragment at clean inter-glyph gaps that
-        fall on column edges.  Returns [(ci, text, x0, x1)]."""
-        runs = []
-        for cx, x0, x1, ch in f["chars"]:
-            ci = _col_of(cx)
-            if runs and runs[-1][0] == ci:
-                runs[-1][1].append((cx, x0, x1, ch))
-            elif runs and x0 - runs[-1][1][-1][2] < 1.2:
-                # 列界压在字形上：字符中心换列但墨迹连续 → 归前段
-                runs[-1][1].append((cx, x0, x1, ch))
+        """Split a cross-column fragment at column edges.  切点 = 组边界
+        附近（±10pt）最大的字符间隙——真实值界两侧有留白，而 SLANet 的
+        边缘可能偏 1-2 个字（"183,020,977,818100.00" 的真界在 8.2pt
+        间隙处，网格边却在 "100.00" 内部）；找不到间隙的墨迹连续段
+        （CJK 词被斜切）并入前段，绝不硬切。子段按自身中心归属列。"""
+        chars = f["chars"]
+        n = len(chars)
+        if n == 0:
+            return []
+        # 按字符中心分箱 → 组；组间即候选切点
+        groups: List[tuple] = []
+        cur = [chars[0]]
+        cur_ci = _col_of(chars[0][0])
+        for ch in chars[1:]:
+            ci = _col_of(ch[0])
+            if ci == cur_ci:
+                cur.append(ch)
             else:
-                runs.append((ci, [(cx, x0, x1, ch)]))
-        out = []
-        for ci, cs in runs:
-            if cs:
-                out.append((ci, "".join(c[3] for c in cs),
-                            min(c[1] for c in cs), max(c[2] for c in cs)))
-        return out
+                groups.append((cur_ci, cur))
+                cur = [ch]
+                cur_ci = ci
+        groups.append((cur_ci, cur))
+        if len(groups) == 1:
+            return [(cur_ci, f["text"], f["x0"], f["x1"])]
+        cuts: List[int] = []
+        start = 0
+        for gi in range(len(groups) - 1):
+            edge = col_edges[groups[gi][0] + 1]
+            best_w, best_i = 0.35, None
+            lo_j = max(1, start + 1)
+            hi_j = min(n - 1, start + len(groups[gi][1]) + 6)
+            for j in range(lo_j, hi_j + 1):
+                g = chars[j][1] - chars[j - 1][2]
+                mid = (chars[j - 1][2] + chars[j][1]) / 2.0
+                if abs(mid - edge) <= 10.0 and g > best_w:
+                    best_w, best_i = g, j
+            if best_i is not None:
+                cuts.append(best_i)
+                start = best_i
+            # 无间隙：不设切点，该组合并进前段（CJK 斜切保护）
+        pieces: List[tuple] = []
+        start = 0
+        for cut in cuts + [n]:
+            if cut <= start:
+                continue
+            cs = chars[start:cut]
+            px0 = min(c[1] for c in cs)
+            px1 = max(c[2] for c in cs)
+            pieces.append((_col_of((px0 + px1) / 2.0),
+                           "".join(c[3] for c in cs), px0, px1))
+            start = cut
+        # 相邻同列子段合并
+        merged: List[tuple] = []
+        for ci, text, px0, px1 in pieces:
+            if merged and merged[-1][0] == ci:
+                p = merged[-1]
+                merged[-1] = (ci, p[1] + text, p[2], px1)
+            else:
+                merged.append((ci, text, px0, px1))
+        return merged
 
     # group fragments per row interval (by fragment vertical centre)
     by_row: dict = {}
@@ -482,23 +582,25 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
                      0), n_r - 1)
         by_row.setdefault(ri, []).append(f)
 
-    # Gap completion: a wide inter-fragment gap (>=2pt) confirmed by
-    # several rows but lacking a column edge within ±3pt means the edge
-    # set is UNDER-FIT — the candidate competition tied on crossing
+    # Gap completion: a wide inter-fragment gap (>= GAPVOTE_MIN_GAP)
+    # confirmed by several rows but lacking a column edge within ±3pt means
+    # the edge set is UNDER-FIT — the candidate competition tied on crossing
     # rates and an under-fit candidate won （资产负债摘要表: 追溯后/
     # 追溯前 boundary missing, "2,759,2372,752,710" fused）.  Insert
     # boundaries at the confirmed gap midpoints — whitespace-only
-    # insertion, monotone safe.
+    # insertion, monotone safe.  阈值 4pt：片段间隙本就 ≥FRAG_GAP(3pt)，
+    # 3-4pt 的窄缝多为行内混排空格/窄标签间隙，不是列界。
     gap_votes: dict = {}
     n_multi = 0
-    for rfs in by_row.values():
-        rfs = sorted(rfs, key=lambda f: f["x0"])
+    all_rows = [sorted(rfs, key=lambda f: f["x0"])
+                for rfs in by_row.values()]
+    for rfs in all_rows:
         if len(rfs) < 2:
             continue
         n_multi += 1
         for a, b in zip(rfs, rfs[1:]):
             gap = b["x0"] - a["x1"]
-            if gap >= 2.0:
+            if gap >= GAPVOTE_MIN_GAP:
                 mid = (a["x1"] + b["x0"]) / 2.0
                 # ±10pt: 右对齐数值列的参差空白（gap 中点每行漂移
                 # 十余 pt）不算缺失边界——附近已有边界即认账；真正的
@@ -509,7 +611,15 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
     for key, votes in list(gap_votes.items()):
         if len(votes) >= need_votes:
             import bisect as _b
-            _b.insort(col_edges, sum(votes) / len(votes))
+            mid = sum(votes) / len(votes)
+            # 交叉否决：候选边界上有片段横穿（如间隔姓名"周 松"的空隙，
+            # "李战明" 无空格整名横穿）→ 不是列界。真列界两侧的文字
+            # 永远分属不同片段
+            crossed = sum(1 for rfs in all_rows
+                          for f in rfs
+                          if f["x0"] + 1.0 < mid < f["x1"] - 1.0)
+            if crossed == 0:
+                _b.insort(col_edges, mid)
     n_c = len(col_edges) - 1
 
     cells: List[CellOutput] = []
@@ -555,11 +665,16 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
             fs = sorted(placed[ci], key=lambda f: (f["y0"], f["x0"]))
             parts: List[str] = []
             last_y = None
+            last_x1 = None
             for f in fs:
                 if last_y is not None and f["y0"] - last_y > 3.0:
                     parts.append("\n")
+                elif last_x1 is not None and f["x0"] - last_x1 > 1.2:
+                    # 同行拆出的子段间隙 >1.2pt → 词间空格
+                    parts.append(" ")
                 parts.append(f["text"])
                 last_y = f["y0"]
+                last_x1 = f["x1"]
             text = "".join(parts).strip()
             if text:
                 cells.append(CellOutput(
@@ -573,16 +688,54 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
 
 # ── Wrapped-label band merge（三线表折行标签） ─────────────────────────────
 
-WRAP_FILL = 0.85       # 折行首行顶满标签列宽度的比例阈值
+WRAP_FILL = 0.62       # 折行首行顶满标签列宽度的比例阈值
 WRAP_LEFT_TOL = 15.0   # 续行起始 x 与标签列左缘的容差（pt）
 _WRAP_COMPLETE_END = re.compile(r'[：:；;。．）)％%]$|\d$|\d\s*日$')
 _WRAP_ENUM_PREFIX = (
-    re.compile(r'^[（(]?\d{1,3}[.、)）．]\s*\S'),          # 1. / (3) / （2）、
+    re.compile(r'^[（(]?\d{1,3}[.．](?!\d)\s*\S'),          # 1. / 3．内容
+    re.compile(r'^[（(]?\d{1,3}[、)）]\s*\S'),               # (3) / 1、
     re.compile(r'^[（(]?[一二三四五六七八九十]{1,3}[)）、.．]\s*\S'),  # 一、/（一）
     re.compile(r'^\(?[ivxIVXa-zA-Z]{1,4}[.、)）]\s*\S'),   # (a) / iv.
     re.compile(r'^[•·●▪◦‣■○–─-]\s*\S'),                   # bullets
     re.compile(r'^[①-⑳㉑-㉟]\s*\S'),                        # circled
 )
+
+
+_HEADER_NUM_RE = re.compile(r'\d[\d,.，]*\d|\d')
+
+
+def _merge_header_bands(rows: list, edges: List[float]) -> list:
+    """
+    表头折行合并：无行线表格的表头单元格文字折成 2-3 行时，文本带把
+    一个表头拆成多行——薪酬表"2024 年在本公司领取的税前报酬总额
+    （人民币千元）"跨三行，每行各自成带成行，表头碎裂串格。
+
+    判据：第一个含数字片段的带之前（数据行的签名是数字）全是不含数字
+    的纯文字带，且这些带的片段铺开的列宽 < 70% 网格宽（表头折行只
+    占自己那一列，数据行横跨全宽）→ 合并成一个表头带。
+    数据行首行（含数字）绝不被并入；纯文字表格（无任何数字带）不动。
+    """
+    if len(rows) < 3 or len(edges) < 3:
+        return rows
+    grid_w = edges[-1] - edges[0]
+
+    def has_num(band) -> bool:
+        return any(_HEADER_NUM_RE.search(t) for _x0, _x1, t in band[2])
+
+    def span_frac(band) -> float:
+        xs = [x for x0, x1, _t in band[2] for x in (x0, x1)]
+        return (max(xs) - min(xs)) / grid_w if xs else 0.0
+
+    first_num = next((i for i, r in enumerate(rows) if has_num(r)), None)
+    if first_num is None or first_num < 2:
+        return rows
+    head = rows[:first_num]
+    if any(span_frac(b) >= 0.70 for b in head):
+        return rows
+    merged = [min(b[0] for b in head), max(b[1] for b in head),
+              sorted((s for b in head for s in b[2]),
+                     key=lambda s: (s[0], s[1]))]
+    return [merged] + rows[first_num:]
 
 
 def _wrap_veto(t1: str, t2: str) -> bool:
@@ -726,7 +879,10 @@ def rebuild_grid(page: fitz.Page, box: Rect,
     best_rate = _span_crossing_rate(rows, edges)
     for name, cand in cands[1:]:
         rate = _span_crossing_rate(rows, cand)
-        if rate < best_rate - 1e-9:
+        # 平票取列数更少的候选：跨列率同为 0 时，多出来的边只可能是
+        # 行内空格上的假边界（幽灵空列的来源）
+        if rate < best_rate - 1e-9 or \
+                (abs(rate - best_rate) <= 1e-9 and len(cand) < len(edges)):
             best_name, best_rate, edges = name, rate, cand
     n_cols = len(edges) - 1
     rules = _ruled_row_edges(page, box)
@@ -737,15 +893,52 @@ def rebuild_grid(page: fitz.Page, box: Rect,
         # Density guard: hybrid tables (ruled head, wireless tail held
         # together by subtotal double-rules) yield sparse rule intervals
         # that would fuse many text rows per cell.  Rules win only when
-        # they structure at least 80% of the text rows.
-        if len(cand) >= 0.8 * len(rows):
-            intervals = cand
+        # they structure at least 80% of the text rows — 按带覆盖计：
+        # 折行单元格（股东名、薪酬表头）把文本带撑到比行线区间多，
+        # 按"区间数 ≥ 0.8×带数"计会错杀行线，按"带被某个行线区间
+        # 完整包含"计则不受折行影响
+        covered = sum(
+            1 for y0, y1, _s in rows
+            if any(a - 1.0 <= y0 and y1 <= b + 1.0 for a, b in cand))
+        if rows and covered >= 0.8 * len(rows):
+            # 三线格数据区：上下边线之间没有行线，多条数据带落在同一个
+            # 行线区间里（p53 关联交易表 3 行数据 47,026/123,253/170,279
+            # 被压成一行）。相邻带细分判据：只要前带带值列墨迹就切——
+            # 唯一例外是折行标签（前带仅标签列有墨迹且不是结构性收尾
+            # 行），它并入后带；"归属于："这类冒号收尾的结构行独立成行
+            def _has_value_ink(band) -> bool:
+                return any(x1 > edges[1] + 2.0 for x0, x1, _t in band[2])
+
+            def _structural_end(band) -> bool:
+                t = "".join(s[2] for s in sorted(band[2])).rstrip()
+                return bool(t) and (t[-1] in "：:；;。" or
+                                    any(rx.match(t) for rx in _WRAP_ENUM_PREFIX))
+
+            def _label_only(band) -> bool:
+                return not _has_value_ink(band)
+
+            intervals = []
+            for a, b in cand:
+                inner = [r for r in rows
+                         if a - 1.0 <= r[0] and r[1] <= b + 1.0]
+                if len(inner) >= 2:
+                    bounds = [a]
+                    for k in range(len(inner) - 1):
+                        b1, b2 = inner[k], inner[k + 1]
+                        if _label_only(b1) and not _structural_end(b1):
+                            continue        # 折行标签并入后带
+                        bounds.append((b1[1] + b2[0]) / 2)
+                    bounds.append(b)
+                    intervals.extend(zip(bounds, bounds[1:]))
+                else:
+                    intervals.append((a, b))
             n_rows = len(intervals)
             # assignment runs over the FULL rule set; only kept intervals
             # emit cells (double-rule slivers hold no text)
-            row_edges = rules
-            keep_rows = [rules.index(a) for a, _b in intervals]
+            row_edges = sorted({v for ab in intervals for v in ab})
+            keep_rows = [row_edges.index(a) for a, _b in intervals]
     if row_edges is None:
+        rows = _merge_header_bands(rows, edges)
         # y boundaries: bbox top, then band midpoints, then bbox bottom
         yb = [box[1]]
         for a, b in zip(rows, rows[1:]):
@@ -790,7 +983,9 @@ def _numeric_gap(page: fitz.Page, table_bbox: Rect,
     ratio trigger, but fatal for a financial corpus.
     """
     text = "".join(c.text for c in cells).replace(",", "").replace(" ", "")
-    region = page.get_text("text", clip=fitz.Rect(*table_bbox))
+    clip = fitz.Rect(table_bbox[0] - 4.0, table_bbox[1] - 4.0,
+                     table_bbox[2] + 4.0, table_bbox[3] + 4.0)
+    region = page.get_text("text", clip=clip)
     missing = 0
     for tok in NUM_TOKEN.findall(region):
         v = tok.replace(",", "").replace(" ", "")

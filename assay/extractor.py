@@ -130,7 +130,9 @@ def _is_page_header(text: str) -> bool:
     return True
 
 
-def _detect_heading_label(text: str, max_font: float) -> str:
+def _detect_heading_label(text: str, max_font: float,
+                          is_bold: bool = False,
+                          left_aligned: bool = True) -> str:
     """
     Classify text as heading based on structural patterns and font size.
 
@@ -161,18 +163,117 @@ def _detect_heading_label(text: str, max_font: float) -> str:
         if len(content_after) >= 2 and digit_groups <= 2 \
                 and not content_after.endswith('。'):
             return "subsection_heading"
+    if is_bold and left_aligned and text_len <= 40 \
+            and not text.endswith(('。', '：', ':')) \
+            and not re.fullmatch(r'[（(][^）)]{0,6}[）)]|\d[\d.、]*', text):
+        # 描边假粗体（fill+stroke 双重渲染）是本报告标题的通用签名：
+        # "12、报告期后事项"、"审计师确认"、"意见的基础" 都靠它识别。
+        # 句号收尾的粗体行是强调句不是标题
+        return "subsection_heading"
     if max_font >= 16 and text_len <= 40:
         return "section_heading"
     return "text"
 
 
 _WRAP_ENUM_PREFIX = (
-    re.compile(r'^[（(]?\d{1,3}[.、)）．]\s*\S'),          # 1. / (3) / （2）、
+    # 小数排除："1.6"/"27.4"/"(5.9)" 是数值不是编号——负向先行否定
+    # 数字才能放行 "1. 内容" 同时拦住 "1.6注：…" 幽灵拼接
+    re.compile(r'^[（(]?\d{1,3}[.．](?!\d)\s*\S'),          # 1. / 3．内容
+    re.compile(r'^[（(]?\d{1,3}[、)）]\s*\S'),               # (3) / 1、
     re.compile(r'^[（(]?[一二三四五六七八九十]{1,3}[)）、.．]\s*\S'),  # 一、/（一）
     re.compile(r'^\(?[ivxIVXa-zA-Z]{1,4}[.、)）]\s*\S'),   # (a) / iv.
     re.compile(r'^[•·●▪◦‣■○–─-]\s*\S'),                   # bullets
     re.compile(r'^[①-⑳㉑-㉟]\s*\S'),                        # circled
 )
+
+
+def _stroke_bold_keys(page: fitz.Page) -> set:
+    """
+    假粗体签名：本报告的标题字形以 fill+stroke 双重渲染（texttrace 里
+    同一段文字出现 type=0 填充与 type=1 描边两条记录），正文字形只有
+    填充。返回描边渲染的 (font, size, text) 键集合——dict 提取的 span
+    命中即视为粗体行。
+    """
+    keys: set = set()
+    try:
+        traces = page.get_texttrace()
+    except Exception:
+        return keys
+    for sp in traces:
+        if sp.get("type") in (1, 2):
+            try:
+                txt = "".join(chr(c[0]) for c in sp.get("chars", []))
+            except Exception:
+                continue
+            if txt.strip():
+                keys.add((sp.get("font", ""), round(sp.get("size", 0), 1),
+                          txt))
+    return keys
+
+
+def _span_is_bold(s: dict, stroke_keys: set) -> bool:
+    t = s.get("text", "")
+    if not t.strip():
+        return False
+    if s.get("flags", 0) & 16 or "bold" in s.get("font", "").lower():
+        return True
+    font, size = s.get("font", ""), round(s.get("size", 0), 1)
+    if (font, size, t) in stroke_keys:
+        return True
+    # 粒度差异：描边跨度与 dict span 的切分不一致（"、报告期后事项"
+    # vs 描边 "报告期后事项"），按包含关系匹配——但被包含方须占
+    # span 文字的六成以上，否则正文句子包含标题措辞（"深化新能源
+    # 上网电价市场化改革…"含页内粗体标题全文）会整行误判粗体
+    for f, sz, tt in stroke_keys:
+        if sz == size and len(tt) >= 2 \
+                and (len(tt) >= 0.6 * len(t) and tt in t
+                     or len(t) >= 0.6 * len(tt) and t in tt):
+            return True
+    return False
+
+
+def _merge_siblin_rows(lines: List[dict], em: float) -> List[dict]:
+    """
+    同一视觉行上的相邻 line 对象按 x 拼成一条逻辑行。
+
+    PyMuPDF 把编号列（"1" + "公司简介"）、混合字体、项目符号（"•" +
+    正文）、"标签：值" 两栏、行内引用括号（"签署《…协议》" + "（"2024
+    年衍生品框架协议"）。根据2024"）拆成独立 line 对象——y 中心相同
+    而 x 相邻。不拼接则阅读顺序被打乱（引用括号插进句中）、编号被当
+    成孤立行丢弃。左侧为"前缀样"片段（短编号/项目符号/冒号结尾标签）、
+    或该行恰好只有两个片段时拼接（间隙 -14~60pt，容许轻度重叠）；
+    三个以上片段共享一行是表格行碎片，不拼。
+    """
+    if not lines:
+        return lines
+    lines.sort(key=lambda l: ((l["y0"] + l["y1"]) / 2.0, l["x0"]))
+    counts: List[int] = []
+    for l in lines:
+        cy = (l["y0"] + l["y1"]) / 2.0
+        counts.append(sum(1 for m in lines
+                          if abs((m["y0"] + m["y1"]) / 2.0 - cy) <= 2.5))
+    out: List[dict] = []
+    for l, row_n in zip(lines, counts):
+        if out:
+            p = out[-1]
+            pcy = (p["y0"] + p["y1"]) / 2.0
+            cy = (l["y0"] + l["y1"]) / 2.0
+            gap = l["x0"] - p["x1"]
+            ptxt = p["text"].rstrip()
+            prefix_like = len(ptxt) <= 4 or ptxt.endswith(("：", ":"))
+            if (prefix_like or row_n == 2) \
+                    and abs(cy - pcy) <= 4.0 and -14.0 <= gap <= 100.0:
+                joiner = " " if gap > 1.0 else ""
+                p["text"] = ptxt + joiner + l["text"].lstrip()
+                p["x1"] = max(p["x1"], l["x1"])
+                p["y0"] = min(p["y0"], l["y0"])
+                p["y1"] = max(p["y1"], l["y1"])
+                if l["bold"] and len(l["text"]) >= len(ptxt):
+                    p["bold"] = True
+                p["size"] = max(p["size"], l["size"])
+                continue
+        out.append(l)
+    return out
 
 
 def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
@@ -186,8 +287,8 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
     continuation lines sit flush left.  That indent is the paragraph
     boundary signature:
 
-      indent line (x0 ≈ body + 1.2~3.2 em) → new paragraph
-      flush line   (x0 ≈ body margin)      → continuation, merged
+      indent line (x0 ≈ body + 1.2~ em)   → new paragraph
+      flush line   (x0 ≈ body margin)     → continuation, merged
 
     Headings, right-aligned annotations and table fragments match
     neither cluster and keep their own blocks (table-internal text is
@@ -197,26 +298,52 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
 
     lines = []
     max_font_page = 0.0
+    page_h = page.rect.height
+    stroke_bold = _stroke_bold_keys(page)
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             spans = line.get("spans", [])
+            total = bold_len = 0
+            sizes: List[float] = []
+            for s in spans:
+                t = s.get("text", "")
+                if not t or not t.strip():
+                    # 行尾空白 span 可能带更大的字号（仿宋空格 15pt），
+                    # 计入会把 12pt 正文行标成 15pt 而拒绝续行合并
+                    continue
+                total += len(t)
+                sz = s.get("size", 0)
+                sizes.append(sz)
+                if _span_is_bold(s, stroke_bold):
+                    bold_len += len(t)
             txt = "".join(s.get("text", "") for s in spans).strip()
             if not txt:
                 continue
             x0, y0, x1, y1 = line["bbox"]
-            size = max((s.get("size", 0) for s in spans), default=0)
+            size = max(sizes) if sizes else 0.0
             max_font_page = max(max_font_page, size)
             lines.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                          "text": txt, "size": size})
+                          "text": txt, "size": size,
+                          "bold": total > 0 and bold_len >= 0.5 * total})
     if not lines:
         return []
-    lines.sort(key=lambda l: (round(l["y0"], 1), l["x0"]))
 
-    # drop page-number furniture（"- 125 -" / "· 13 -"）
-    lines = [l for l in lines
-             if not re.match(r'^[-·•—–\s]*\d{1,3}\s*[-—]?\s*$', l["text"])]
+    # drop page-number furniture: dash-wrapped ("- 116 -") anywhere, bare
+    # numbers only in the bottom strip — 附注节标题编号（"1 公司简介" 的
+    # "1"）是独立 line 对象且位于正文区，绝不能当页码丢弃
+    def _is_pageno(l: dict) -> bool:
+        t = l["text"].strip()
+        if re.match(r'^[-·•—–]\s*\d{1,3}\s*[-—]\s*$', t):
+            return True
+        if re.fullmatch(r'[-·•—–\s]*\d{1,3}[-—]?', t) \
+                and l["y0"] > page_h - 72:
+            return True
+        return False
+
+    lines = [l for l in lines if not _is_pageno(l)]
+    lines = _merge_siblin_rows(lines, 12.0)
 
     # em width ≈ median per-character advance (for the indent-shift test)
     advs = sorted((l["x1"] - l["x0"]) / len(l["text"]) for l in lines
@@ -239,23 +366,55 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
     for l in lines:
         row_frag = ybucket[round(l["y0"] / 2.0)] >= 2
         shift = (l["x0"] - prev_x0) if prev_x0 is not None else None
-        new_para = shift is not None and 1.2 * em <= shift <= 3.2 * em
+        # 不设上限：右对齐落款（"承董事会命"）x0 前移几十 em，也是
+        # 换段——旧上限会把落款吸进正文段尾
+        new_para = shift is not None and shift >= 1.2 * em
         cur_text = "".join(x["text"] for x in cur).strip()
         cur_size = cur[-1]["size"] if cur else 0.0
         cur_starts_wide = cur and (cur[0]["x1"] - cur[0]["x0"]) >= 0.55 * page_w
         # 裸编号标记（审计报告 "(2)" 单独一行）：孤立短标记行吸收其
-        # 内容段，标记与内容不再分离
-        bare_marker = cur and len(cur_text) <= 6 and (
+        # 内容段，标记与内容不再分离。粗体块（标题）不吸收；括号内是
+        # 纯数字的（"(5.9)" 表末格数值泄漏）不是标记
+        bare_marker = cur and not cur[-1]["bold"] and len(cur_text) <= 6 \
+            and not re.fullmatch(r'[（(]\s*[\d.,，%+\-—\s]+\s*[）)]',
+                                 cur_text) and (
             cur_text.startswith("(") or cur_text.startswith("（") or
             any(rx.match(cur_text) for rx in _WRAP_ENUM_PREFIX))
         # merge guards: size change (heading vs body), introductory
-        # colon（"各位股东："）, and dot-leader lines（目录条目）
+        # colon（"各位股东："）, dot-leader lines（目录条目）, boldness
+        # flip（标题行绝不并入正文、正文绝不吞掉标题行）——但折行的
+        # 长粗体标题（"（2）除中国石油集团外…（不包括香港…"）的续行
+        # 仍须并入：块尾非句末标点且已有内容 >12 字时放行
         same_style = cur and abs(cur_size - l["size"]) <= 1.0
         intro_colon = cur_text.endswith("：") or cur_text.endswith(":")
         dot_leader = "...." in l["text"] or "····" in l["text"]
+        bold_flip = cur and (cur[-1]["bold"] != l["bold"]) \
+            and not (cur[-1]["bold"] and len(cur_text) > 12
+                     and cur_text.rstrip()[-1:] not in "。；！？：")
+        # 目录条目收尾（"……·····99"）后不再吸收——下一行是新条目
+        toc_end = re.search(r'[·．.]{3,}\s*[-—]?\s*\d{1,3}$', cur_text)
+        # "标签：值" 面板行（"公司注册中文名称：…"）各自成行：行内
+        # 前段带冒号的行不再并入同样带冒号的上一行
+        label_colon = re.match(r'^[^：:，。；\s]{1,20}[：:]', l["text"]) \
+            and ("：" in cur_text or ":" in cur_text) \
+            and not intro_colon
+        # 枚举断段：上一行以句末标点收尾、本行以编号/项目符号开头
+        # （"……(2) 香港中央结算…" 注释条目各自成段）
+        prev_final = cur and cur[-1]["text"].rstrip()[-1:] in "。；！？!?"
+        enum_break = (prev_final and not new_para and shift is not None
+                      and abs(shift) < 1.2 * em
+                      and any(rx.match(l["text"])
+                              for rx in _WRAP_ENUM_PREFIX))
+        # 短枚举行（"（1）截至…证券发行情况"、列表项单行）：不吸收
+        # 后续行——标题/条目各自成段；顶满行宽的枚举行是折行条目的
+        # 首行，续行照常并入
+        enum_head = cur and len(cur_text) <= 40 \
+            and any(rx.match(cur_text) for rx in _WRAP_ENUM_PREFIX) \
+            and cur[-1]["x1"] < 0.82 * page_w
         if cur and (cur_starts_wide or bare_marker) and not row_frag \
                 and not new_para and same_style and not intro_colon \
-                and not dot_leader:
+                and not dot_leader and not bold_flip and not enum_break \
+                and not toc_end and not label_colon and not enum_head:
             cur.append(l)               # continuation line
         else:
             if cur:
@@ -267,23 +426,38 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
 
     outputs: List[TextOutput] = []
     for para in paragraphs:
-        para.sort(key=lambda l: (round(l["y0"], 1), l["x0"]))
-        full_text = "".join(l["text"] for l in para).strip()
+        para.sort(key=lambda l: ((l["y0"] + l["y1"]) / 2.0, l["x0"]))
+        full_text = ""
+        for l in para:
+            # 折行拼接：拉丁词在行尾断开时补空格（"DeGolyer and" +
+            # "MacNaughton"），CJK 直接连排
+            if full_text and re.search(r'[A-Za-z]$', full_text) \
+                    and re.match(r'[A-Za-z(]', l["text"]):
+                full_text += " "
+            full_text += l["text"]
+        full_text = full_text.strip()
         if not full_text:
             continue
         # Wingdings 项目符号的 ToUnicode 缺失：行首 'D'+中文 → '■'
         full_text = re.sub(r'^D(?=[\u4e00-\u9fff])', '■', full_text)
         full_text = re.sub(r'\nD(?=[\u4e00-\u9fff])', '\n■', full_text)
-        if len(full_text) < 4 and (full_text.isdigit() or full_text in ("年报", "年", "页")):
-            continue
-        if _is_page_header(full_text):
-            continue
-        max_font = max(l["size"] for l in para)
-        label = _detect_heading_label(full_text, max_font)
         px0 = min(l["x0"] for l in para)
         py0 = min(l["y0"] for l in para)
         px1 = max(l["x1"] for l in para)
         py1 = max(l["y1"] for l in para)
+        # 孤立短数字块只可能是页脚残留（页码过滤器已按位置收窄），正文
+        # 区的数字块是 "857" 这类标签值，必须保留
+        if len(full_text) < 4 and (full_text.isdigit()
+                                   or full_text in ("年报", "年", "页")) \
+                and py0 > page_h - 72:
+            continue
+        if _is_page_header(full_text):
+            continue
+        max_font = max(l["size"] for l in para)
+        label = _detect_heading_label(
+            full_text, max_font,
+            is_bold=all(l["bold"] for l in para),
+            left_aligned=px0 <= 0.45 * page_w)
         outputs.append(TextOutput(
             text=full_text, page_no=page_idx, label=label,
             bbox=(round(px0, 1), round(py0, 1), round(px1, 1), round(py1, 1)),
@@ -332,6 +506,56 @@ def _cell_bbox_to_rect(bbox_8: np.ndarray) -> Tuple[float, float, float, float]:
     ys = bbox_8[1::2]  # y0, y2, y4, y6
     return (float(np.min(xs)), float(np.min(ys)),
             float(np.max(xs)), float(np.max(ys)))
+
+
+def _table_char_index(page: fitz.Page,
+                      table_bbox: Tuple[float, float, float, float]
+                      ) -> List[Tuple[float, float, float, float, str, float]]:
+    """Visible glyphs inside the table region as
+    (x0, y0, x1, y1, char, line_y) — the atoms for best-overlap
+    assignment.  clip 提取（get_text clip）会把任何与单元格相交的字形
+    都算进去，相邻表头的首几个字（"2024"→"202"）、折行邻格的尾字
+    （"民币"、""）因此串格；按字形归属才能根治。"""
+    raw = page.get_text(
+        "rawdict",
+        clip=fitz.Rect(table_bbox[0] - 4.0, table_bbox[1] - 4.0,
+                       table_bbox[2] + 4.0, table_bbox[3] + 4.0))
+    chars: List[Tuple[float, float, float, float, str, float]] = []
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            ly0 = line["bbox"][1]
+            for span in line.get("spans", []):
+                for ch in span.get("chars", []):
+                    c = ch.get("c", "")
+                    if not c or not c.strip():
+                        continue
+                    bx = ch.get("bbox", (0, 0, 0, 0))
+                    if bx[2] <= bx[0] or bx[3] <= bx[1]:
+                        continue
+                    chars.append((bx[0], bx[1], bx[2], bx[3], c, ly0))
+    return chars
+
+
+def _chars_to_text(chars: List[Tuple[float, float, float, float, str, float]]
+                   ) -> str:
+    """Assigned glyphs → cell text: 同行按 x 排接，行间（y 跨 >3pt）
+    插 \\n，同行间隙 >1.2pt 补空格（拉丁词距）。"""
+    if not chars:
+        return ""
+    chars = sorted(chars, key=lambda c: (round(c[5], 1), c[0]))
+    parts: List[str] = []
+    last_y = None
+    last_x1 = None
+    for x0, y0, x1, y1, c, ly in chars:
+        if last_y is not None:
+            if ly - last_y > 3.0:
+                parts.append("\n")
+            elif x0 - last_x1 > 1.2:
+                parts.append(" ")
+        parts.append(c)
+        last_y = ly
+        last_x1 = x1
+    return "".join(parts).strip()
 
 
 def build_table_from_slanet(
@@ -409,28 +633,78 @@ def build_table_from_slanet(
 
     table_cells: List[CellOutput] = []
 
+    # PyMuPDF native text extraction (Step 7) — glyph best-overlap
+    # assignment instead of clip: a glyph goes to the cell that contains
+    # its centre (smallest containing cell wins on drift overlap), or to
+    # the cell it overlaps most when its centre sits between cells
+    # （右对齐数值的首个 "(" 中心偏出 1.5pt 仍归本格）.  clip 会把相
+    # 邻表头压线的字形整段吸进来（"202"、"民币" 幽灵残字的根源）
+    all_chars: List = []
+    if table_bbox is not None:
+        try:
+            all_chars = _table_char_index(page, table_bbox)
+        except Exception:
+            all_chars = []
+
+    cell_rects: List[Tuple[float, float, float, float]] = []
+    cell_meta: List[Tuple[int, int, int, int, tuple]] = []
     for i in range(n_cells):
         bbox_8 = cell_bboxes[i]
         lp = logic_points[i]
         start_row, end_row, start_col, end_col = int(lp[0]), int(lp[1]), int(lp[2]), int(lp[3])
-
-        # Convert crop-local 8-point bbox → axis-aligned rect in crop coords
         cx0, cy0, cx1, cy1 = _cell_bbox_to_rect(bbox_8)
+        ix0, iy0 = cx0 + crop_x0, cy0 + crop_y0
+        ix1, iy1 = cx1 + crop_x0, cy1 + crop_y0
+        pdf_bbox = (ix0 * scale_x, iy0 * scale_y,
+                    ix1 * scale_x, iy1 * scale_y)
+        cell_meta.append((start_row, end_row, start_col, end_col, pdf_bbox))
+        cell_rects.append(pdf_bbox)
 
-        # Crop-local → page-image coords
-        ix0 = cx0 + crop_x0
-        iy0 = cy0 + crop_y0
-        ix1 = cx1 + crop_x0
-        iy1 = cy1 + crop_y0
+    assigned: List[List] = [[] for _ in range(n_cells)]
+    if all_chars and cell_rects:
+        areas = [(r[2] - r[0]) * (r[3] - r[1])
+                 if r[2] > r[0] and r[3] > r[1] else 1e18
+                 for r in cell_rects]
+        for ch in all_chars:
+            cx, cy = (ch[0] + ch[2]) / 2.0, (ch[1] + ch[3]) / 2.0
+            carea = (ch[2] - ch[0]) * (ch[3] - ch[1])
+            contain = [ci for ci, r in enumerate(cell_rects)
+                       if r[2] > r[0] and r[3] > r[1]
+                       and r[0] - 0.5 <= cx <= r[2] + 0.5
+                       and r[1] - 0.5 <= cy <= r[3] + 0.5]
+            if contain:
+                assigned[min(contain, key=lambda ci: areas[ci])].append(ch)
+                continue
+            best, best_score = -1, 0.30
+            for ci, r in enumerate(cell_rects):
+                if r[3] + 2 < cy or r[1] - 2 > cy:
+                    continue
+                ix0, iy0 = max(ch[0], r[0]), max(ch[1], r[1])
+                ix1, iy1 = min(ch[2], r[2]), min(ch[3], r[3])
+                if ix1 <= ix0 or iy1 <= iy0:
+                    continue
+                score = (ix1 - ix0) * (iy1 - iy0) / carea
+                if score > best_score:
+                    best, best_score = ci, score
+            if best >= 0:
+                assigned[best].append(ch)
+                continue
+            # 最近格兜底：SLANet 窄格边缘的字形（"…31 日" 的"日"）中心
+            # 落在所有格之外 5pt 以内时归最近的格，避免边缘字丢失
+            best, best_dist = -1, 5.0
+            for ci, r in enumerate(cell_rects):
+                if r[2] <= r[0] or r[3] <= r[1]:
+                    continue
+                dx = max(r[0] - cx, 0.0, cx - r[2])
+                dy = max(r[1] - cy, 0.0, cy - r[3])
+                d = (dx * dx + dy * dy) ** 0.5
+                if d < best_dist:
+                    best, best_dist = ci, d
+            if best >= 0:
+                assigned[best].append(ch)
 
-        # Page-image → PDF coords
-        pdf_bbox = (
-            ix0 * scale_x,
-            iy0 * scale_y,
-            ix1 * scale_x,
-            iy1 * scale_y,
-        )
-
+    for i in range(n_cells):
+        start_row, end_row, start_col, end_col, pdf_bbox = cell_meta[i]
         # Validate: PDF bbox must be non-degenerate
         if pdf_bbox[2] <= pdf_bbox[0] or pdf_bbox[3] <= pdf_bbox[1]:
             table_cells.append(CellOutput(
@@ -439,10 +713,8 @@ def build_table_from_slanet(
                 row_span=1, col_span=1,
             ))
             continue
-
-        # PyMuPDF native text clip extraction (Step 7)
-        rect = fitz.Rect(*pdf_bbox)
-        cell_text = page.get_text("text", clip=rect).strip()
+        cell_text = _chars_to_text(assigned[i]) if all_chars else \
+            page.get_text("text", clip=fitz.Rect(*pdf_bbox)).strip()
 
         row_span = end_row - start_row + 1
         col_span = end_col - start_col + 1
