@@ -131,20 +131,48 @@ def _is_page_header(text: str) -> bool:
 
 
 def _detect_heading_label(text: str, max_font: float) -> str:
-    """Classify text as heading based on structural patterns and font size."""
+    """
+    Classify text as heading based on structural patterns and font size.
+
+    The paren-number rules carry a LENGTH CAP: genuine subsection
+    headings are short phrases （"(1) 按国际财务报告会计准则编制的
+    主要财务数据" = 22 字）, while foot-note ITEMS sharing the same
+    "(2) xxx" prefix are full sentences （"(2) 香港中央结算（代理人）
+    有限公司为香港交易及结算所有限公司之全资附属公司…" = 45+ 字）—
+    without the cap every 注 item rendered as a ### heading.
+    """
     import re
     text = text.strip()
     text_len = len(text)
 
     if re.match(r'^第[一二三四五六七八九十百\d]+节', text):
         return "section_heading"
-    if re.match(r'^[一二三四五六七八九十]+、', text):
-        return "subsection_heading"
-    if re.match(r'^[（(][一二三四五六七八九十\d]+[）)]', text):
-        return "subsection_heading"
+    if re.match(r'^[一二三四五六七八九十]+、', text) and text_len <= 30:
+        return "section_heading"
+    if re.match(r'^[（(][一二三四五六七八九十\d]+[）)]', text) \
+            and text_len <= 30:
+        # 精判：真小节标题 = 编号后跟短语、全文本数字组 ≤2、且不以
+        # 句号收尾（句子不是标题）。电话号码 "(852) 2899 2010"（3 个
+        # 数字组）、裸标记 "(2)"（编号后无内容）、审计程序句
+        # （"…审计程序。"句号收尾）统统不是标题
+        content_after = re.sub(r'^[（(][一二三四五六七八九十\d]+[）)]\s*',
+                               '', text)
+        digit_groups = len(re.findall(r'\d[\d,，.]*\d|\d', text))
+        if len(content_after) >= 2 and digit_groups <= 2 \
+                and not content_after.endswith('。'):
+            return "subsection_heading"
     if max_font >= 16 and text_len <= 40:
         return "section_heading"
     return "text"
+
+
+_WRAP_ENUM_PREFIX = (
+    re.compile(r'^[（(]?\d{1,3}[.、)）．]\s*\S'),          # 1. / (3) / （2）、
+    re.compile(r'^[（(]?[一二三四五六七八九十]{1,3}[)）、.．]\s*\S'),  # 一、/（一）
+    re.compile(r'^\(?[ivxIVXa-zA-Z]{1,4}[.、)）]\s*\S'),   # (a) / iv.
+    re.compile(r'^[•·●▪◦‣■○–─-]\s*\S'),                   # bullets
+    re.compile(r'^[①-⑳㉑-㉟]\s*\S'),                        # circled
+)
 
 
 def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
@@ -215,13 +243,19 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
         cur_text = "".join(x["text"] for x in cur).strip()
         cur_size = cur[-1]["size"] if cur else 0.0
         cur_starts_wide = cur and (cur[0]["x1"] - cur[0]["x0"]) >= 0.55 * page_w
+        # 裸编号标记（审计报告 "(2)" 单独一行）：孤立短标记行吸收其
+        # 内容段，标记与内容不再分离
+        bare_marker = cur and len(cur_text) <= 6 and (
+            cur_text.startswith("(") or cur_text.startswith("（") or
+            any(rx.match(cur_text) for rx in _WRAP_ENUM_PREFIX))
         # merge guards: size change (heading vs body), introductory
         # colon（"各位股东："）, and dot-leader lines（目录条目）
         same_style = cur and abs(cur_size - l["size"]) <= 1.0
         intro_colon = cur_text.endswith("：") or cur_text.endswith(":")
         dot_leader = "...." in l["text"] or "····" in l["text"]
-        if cur and cur_starts_wide and not row_frag and not new_para \
-                and same_style and not intro_colon and not dot_leader:
+        if cur and (cur_starts_wide or bare_marker) and not row_frag \
+                and not new_para and same_style and not intro_colon \
+                and not dot_leader:
             cur.append(l)               # continuation line
         else:
             if cur:

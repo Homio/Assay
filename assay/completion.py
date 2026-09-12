@@ -429,7 +429,7 @@ SPAN_CELL_WIDTH = 1.5  # a fragment this many columns wide is a spanning
 def _cells_from_fragments(page: fitz.Page, box: Rect,
                           row_edges: List[float], col_edges: List[float],
                           keep_rows: Optional[List[int]] = None
-                          ) -> List[CellOutput]:
+                          ) -> Tuple[List[CellOutput], List[float]]:
     """
     Build cells by assigning VALUE FRAGMENTS to the row/col interval
     containing each fragment centre.
@@ -500,7 +500,10 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
             gap = b["x0"] - a["x1"]
             if gap >= 2.0:
                 mid = (a["x1"] + b["x0"]) / 2.0
-                if not any(abs(mid - e) <= 3.0 for e in col_edges[1:-1]):
+                # ±10pt: 右对齐数值列的参差空白（gap 中点每行漂移
+                # 十余 pt）不算缺失边界——附近已有边界即认账；真正的
+                # 缺失边界（p8 追溯后/追溯前，缺口 20pt+）仍会投票
+                if not any(abs(mid - e) <= 10.0 for e in col_edges[1:-1]):
                     gap_votes.setdefault(round(mid / 5.0), []).append(mid)
     need_votes = max(2, round(0.3 * n_multi))
     for key, votes in list(gap_votes.items()):
@@ -565,7 +568,7 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
                           col_edges[ci + 1], row_edges[ri + 1]),
                     row=ri, col=ci,
                 ))
-    return cells
+    return cells, col_edges
 
 
 # ── Wrapped-label band merge（三线表折行标签） ─────────────────────────────
@@ -761,8 +764,9 @@ def rebuild_grid(page: fitz.Page, box: Rect,
             intervals = list(zip(yb, yb[1:]))
             n_rows = len(rows)
             row_edges = yb
-    cells = _cells_from_fragments(page, box, row_edges, edges,
-                              keep_rows=keep_rows)
+    cells, edges = _cells_from_fragments(page, box, row_edges, edges,
+                                        keep_rows=keep_rows)
+    n_cols = len(edges) - 1   # 间隙补边可能新增列，以最终列边为准
     if keep_rows is not None:
         # re-index rows from the full rule set down to the kept intervals
         remap = {old: new for new, old in enumerate(sorted(keep_rows))}
