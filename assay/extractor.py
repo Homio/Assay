@@ -279,7 +279,8 @@ def _merge_siblin_rows(lines: List[dict], em: float,
     return out
 
 
-def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
+def extract_page_text(page: fitz.Page, page_idx: int,
+                       header_sigs: Optional[set] = None) -> List[TextOutput]:
     """
     Extract page text with PARAGRAPH REFLOW.
 
@@ -345,7 +346,17 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
             return True
         return False
 
-    lines = [l for l in lines if not _is_pageno(l)]
+    # 跨页共识页眉：同一签名在同一顶部 y 位重复于全书 ≥10% 页面 ——
+    # 真实表格行不可能如此重复。签名由 calibrate_page_headers 全书
+    # 学习（数据驱动，替代按书写的页眉样式匹配）
+    def _is_running_header(l: dict) -> bool:
+        if not header_sigs or l["y0"] >= 90.0:
+            return False
+        sig = re.sub(r"[\d\s]+", "", l["text"])
+        return len(sig) >= 4 and sig in header_sigs
+
+    lines = [l for l in lines if not _is_pageno(l)
+             and not _is_running_header(l)]
     page_w = page.rect.width
 
     # em width ≈ median per-character advance (for the indent-shift test)
@@ -812,7 +823,12 @@ class AssayExtractor:
             total_pages = len(doc)
 
             # ── Phase 1: classify pages & extract text from ALL pages ────
-            from assay.detection import detect_tables_on_page, top_remnant_candidate
+            from assay.detection import (detect_tables_on_page,
+                                         top_remnant_candidate,
+                                         calibrate_page_headers)
+
+            # 全书学习运行页眉签名（跨页重复共识），供各页文本提取过滤
+            header_sigs = calibrate_page_headers(doc)
 
             table_page_indices: List[int] = []
 
@@ -826,7 +842,8 @@ class AssayExtractor:
                     height=rect.height,
                 ))
 
-                texts = extract_page_text(page, page_idx)
+                texts = extract_page_text(page, page_idx,
+                                          header_sigs=header_sigs)
                 for t in texts:
                     result.texts.append(t)
 
