@@ -164,6 +164,12 @@ def _detect_heading_label(text: str, max_font: float,
         if len(content_after) >= 2 and digit_groups <= 2 \
                 and not content_after.endswith('。'):
             return "subsection_heading"
+    m_num = re.match(r'^(\d{1,3})[.．]\s*(\S[^。；]{1,20})$', text)
+    if m_num and not text.endswith(('。', '；', '：', ':')) \
+            and not re.search(r'\d[.,，%]', m_num.group(2)):
+        # 附注节标题 "34. 盈余公积"：编号+短名词、无句末标点、
+        # 标题部分无数字格式（数值句 "1.6 万" 会带）——不依赖粗体
+        return "section_heading"
     if is_bold and left_aligned and text_len <= 40 \
             and not text.endswith(('。', '：', ':')) \
             and not re.fullmatch(r'[（(][^）)]{0,6}[）)]|\d[\d.、]*', text):
@@ -238,44 +244,60 @@ def _merge_siblin_rows(lines: List[dict], em: float,
     """
     同一视觉行上的相邻 line 对象按 x 拼成一条逻辑行。
 
-    PyMuPDF 把编号列（"1" + "公司简介"）、混合字体、项目符号（"•" +
-    正文）、"标签：值" 两栏、行内引用括号（"签署《…协议》" + "（"2024
-    年衍生品框架协议"）。根据2024"）拆成独立 line 对象——y 中心相同
-    而 x 相邻。不拼接则阅读顺序被打乱（引用括号插进句中）、编号被当
-    成孤立行丢弃。左侧为"前缀样"片段（短编号/项目符号/冒号结尾标签）、
-    或该行恰好只有两个片段时拼接（间隙 -14~60pt，容许轻度重叠）；
-    三个以上片段共享一行是表格行碎片，不拼。
+    PyMuPDF 把编号列（"34." + "盈余公积"）、混合字体、项目符号、
+    "标签：值" 两栏、行内引用括号拆成独立 line 对象。同视觉行判定
+    用 y 区间重叠过半（行框高度不一会让中心距产生 0.8pt 级别的颠倒，
+    按中心排序会把编号排到标题后面拼出倒序），行内按 x0 升序拼接，
+    编号列永远回到句首。
     """
     if not lines:
         return lines
-    lines.sort(key=lambda l: ((l["y0"] + l["y1"]) / 2.0, l["x0"]))
-    counts: List[int] = []
-    for l in lines:
-        cy = (l["y0"] + l["y1"]) / 2.0
-        counts.append(sum(1 for m in lines
-                          if abs((m["y0"] + m["y1"]) / 2.0 - cy) <= 2.5))
+    lines.sort(key=lambda l: (l["y0"], l["x0"]))
+    n = len(lines)
+    sibs: List[List[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        li = lines[i]
+        for j in range(i + 1, n):
+            lj = lines[j]
+            if lj["y0"] >= li["y1"]:
+                break
+            ov = min(li["y1"], lj["y1"]) - max(li["y0"], lj["y0"])
+            min_h = max(1.0, min(li["y1"] - li["y0"], lj["y1"] - lj["y0"]))
+            if ov > 0.5 * min_h:
+                # x 关系判定与 y 排序顺序无关：区间重叠（负值=间隙）
+                xov = min(li["x1"], lj["x1"]) - max(li["x0"], lj["x0"])
+                if xov >= -0.17 * page_w:
+                    sibs[i].append(j)
+                    sibs[j].append(i)
+    used = [False] * n
     out: List[dict] = []
-    for l, row_n in zip(lines, counts):
-        if out:
-            p = out[-1]
-            pcy = (p["y0"] + p["y1"]) / 2.0
-            cy = (l["y0"] + l["y1"]) / 2.0
-            gap = l["x0"] - p["x1"]
-            ptxt = p["text"].rstrip()
-            prefix_like = len(ptxt) <= 4 or ptxt.endswith(("：", ":"))
-            if (prefix_like or row_n == 2) \
-                    and abs(cy - pcy) <= 0.33 * em \
-                    and -14.0 <= gap <= 0.17 * page_w:
+    for i in range(n):
+        if used[i]:
+            continue
+        group = sorted((j for j in [i] + sibs[i] if not used[j]),
+                       key=lambda j: lines[j]["x0"])
+        if not group:
+            continue
+        base = dict(lines[group[0]])
+        used[group[0]] = True
+        for j in group[1:]:
+            m = lines[j]
+            used[j] = True
+            if m["x0"] >= base["x0"]:
+                gap = m["x0"] - base["x1"]
                 joiner = " " if gap > 1.0 else ""
-                p["text"] = ptxt + joiner + l["text"].lstrip()
-                p["x1"] = max(p["x1"], l["x1"])
-                p["y0"] = min(p["y0"], l["y0"])
-                p["y1"] = max(p["y1"], l["y1"])
-                if l["bold"] and len(l["text"]) >= len(ptxt):
-                    p["bold"] = True
-                p["size"] = max(p["size"], l["size"])
-                continue
-        out.append(l)
+                base["text"] = base["text"].rstrip() + joiner + m["text"].lstrip()
+            else:
+                gap = base["x0"] - m["x1"]
+                joiner = " " if gap > 1.0 else ""
+                base["text"] = m["text"].rstrip() + joiner + base["text"].lstrip()
+                base["x0"] = m["x0"]
+            base["x1"] = max(base["x1"], m["x1"])
+            base["y0"] = min(base["y0"], m["y0"])
+            base["y1"] = max(base["y1"], m["y1"])
+            base["size"] = max(base["size"], m["size"])
+            base["bold"] = base["bold"] or m["bold"]
+        out.append(base)
     return out
 
 
@@ -348,15 +370,30 @@ def extract_page_text(page: fitz.Page, page_idx: int,
 
     # 跨页共识页眉：同一签名在同一顶部 y 位重复于全书 ≥10% 页面 ——
     # 真实表格行不可能如此重复。签名由 calibrate_page_headers 全书
-    # 学习（数据驱动，替代按书写的页眉样式匹配）
-    def _is_running_header(l: dict) -> bool:
-        if not header_sigs or l["y0"] >= 90.0:
-            return False
-        sig = re.sub(r"[\d\s]+", "", l["text"])
-        return len(sig) >= 4 and sig in header_sigs
-
-    lines = [l for l in lines if not _is_pageno(l)
-             and not _is_running_header(l)]
+    # 学习（数据驱动，替代按书写的页眉样式匹配）。页眉行常由两个
+    # line 对象组成（"四、" + "财务报表附注(续)"），删命中行时其
+    # 同视觉行伙伴一并删除，避免残留孤立半截标题
+    hdr_idx: set = set()
+    for i, l in enumerate(lines):
+        if l["y0"] < 90.0 and header_sigs:
+            sig = re.sub(r"[\d\s]+", "", l["text"])
+            if len(sig) >= 4 and sig in header_sigs:
+                hdr_idx.add(i)
+    if hdr_idx:
+        ys = [(l["y0"], l["y1"]) for l in lines]
+        grown: set = set()
+        for i in hdr_idx:
+            grown.add(i)
+            y0, y1 = ys[i]
+            for j, (a, b) in enumerate(ys):
+                if j == i or j in grown:
+                    continue
+                if a < y1 + 2 and b > y0 - 2:
+                    grown.add(j)
+        lines = [l for i, l in enumerate(lines) if i not in grown]
+    else:
+        lines = [l for l in lines if not _is_pageno(l)]
+    lines = [l for l in lines if not _is_pageno(l)]
     page_w = page.rect.width
 
     # em width ≈ median per-character advance (for the indent-shift test)
@@ -412,6 +449,11 @@ def extract_page_text(page: fitz.Page, page_idx: int,
         label_colon = re.match(r'^[^：:，。；\s]{1,20}[：:]', l["text"]) \
             and ("：" in cur_text or ":" in cur_text) \
             and not intro_colon
+        # 编号节标题（平安附注 "34. 盈余公积" 形状：编号+短名词、
+        # 无句末标点）独立成块——不依赖粗体的标题结构信号
+        _mt = re.match(r'^\d{1,3}[.．]\s*(\S{1,12})$', l["text"])
+        numtitle = bool(_mt) and "." not in _mt.group(1) \
+            and "．" not in _mt.group(1)
         # 枚举断段：上一行以句末标点收尾、本行以编号/项目符号开头
         # （"……(2) 香港中央结算…" 注释条目各自成段）
         prev_final = cur and cur[-1]["text"].rstrip()[-1:] in "。；！？!?"
@@ -428,7 +470,8 @@ def extract_page_text(page: fitz.Page, page_idx: int,
         if cur and (cur_starts_wide or bare_marker) and not row_frag \
                 and not new_para and same_style and not intro_colon \
                 and not dot_leader and not bold_flip and not enum_break \
-                and not toc_end and not label_colon and not enum_head:
+                and not toc_end and not label_colon and not enum_head \
+                and not numtitle:
             cur.append(l)               # continuation line
         else:
             if cur:
