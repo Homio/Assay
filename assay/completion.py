@@ -184,7 +184,28 @@ def structure_suspect(page: fitz.Page, table_bbox: Optional[Rect],
                 break
     if cut >= max(6, CUT_RATIO * len(valid)):
         return True
-    return _column_cut(page, table_bbox, valid) >= 1
+    if _column_cut(page, table_bbox, valid) >= 1:
+        return True
+    # 欠拟合：某文本行的空白分隔片段数 > 网格内部边数+1 —— 网格装不下
+    # 这一行的值（"A 股 | 161,922" 并成一格的签名）。≥2 行成立才触发
+    import bisect as _b
+    edges = sorted({v for c in valid
+                    for v in (c.bbox[0], c.bbox[2])})
+    n_interior = max(0, len(edges) - 2)
+    if n_interior >= 1 and len(valid) >= 4:
+        frags = _line_fragments(page, table_bbox)
+        frags.sort(key=lambda f: f["cy"])
+        bands: List[List[dict]] = []
+        for f in frags:
+            if bands and f["cy"] - bands[-1][-1]["cy"] <= 3.0:
+                bands[-1].append(f)
+            else:
+                bands.append([f])
+        over = sum(1 for bd in bands
+                   if len(bd) - 1 > n_interior and len(bd) >= 3)
+        if over >= 2:
+            return True
+    return False
 
 
 def _column_cut(page: fitz.Page, table_bbox: Rect,
@@ -590,7 +611,7 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
     # boundaries at the confirmed gap midpoints — whitespace-only
     # insertion, monotone safe.  阈值 4pt：片段间隙本就 ≥FRAG_GAP(3pt)，
     # 3-4pt 的窄缝多为行内混排空格/窄标签间隙，不是列界。
-    gap_votes: dict = {}
+    gap_mids: List[float] = []
     n_multi = 0
     all_rows = [sorted(rfs, key=lambda f: f["x0"])
                 for rfs in by_row.values()]
@@ -606,12 +627,21 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
                 # 十余 pt）不算缺失边界——附近已有边界即认账；真正的
                 # 缺失边界（p8 追溯后/追溯前，缺口 20pt+）仍会投票
                 if not any(abs(mid - e) <= 10.0 for e in col_edges[1:-1]):
-                    gap_votes.setdefault(round(mid / 5.0), []).append(mid)
+                    gap_mids.append(mid)
     need_votes = max(2, round(0.3 * n_multi))
-    for key, votes in list(gap_votes.items()):
-        if len(votes) >= need_votes:
+    gap_mids.sort()
+    clusters: List[List[float]] = []
+    for m in gap_mids:
+        # 单链聚类（6pt）：右对齐数值起点每行漂 3-6pt，按 5pt 硬桶
+        # 会把票劈进相邻桶导致不足阈值
+        if clusters and m - clusters[-1][-1] <= 6.0:
+            clusters[-1].append(m)
+        else:
+            clusters.append([m])
+    for cl in clusters:
+        if len(cl) >= need_votes:
             import bisect as _b
-            mid = sum(votes) / len(votes)
+            mid = sum(cl) / len(cl)
             # 交叉否决：候选边界上有片段横穿（如间隔姓名"周 松"的空隙，
             # "李战明" 无空格整名横穿）→ 不是列界。真列界两侧的文字
             # 永远分属不同片段
@@ -820,6 +850,32 @@ def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
     return out
 
 
+def _edge_support(rows: list, edges: List[float]) -> int:
+    """
+    有支撑的内部边数：边两侧 60pt 内都有文字的行占比 ≥0.4 的边。
+    真列界两侧永远各有一格内容（标签列文字起左、数值列右对齐）；
+    幽灵空列的边只有一侧有内容。穿过率同为 0 时，多出的"有支撑"
+    边是真实结构，必须保留——否则宽留白真界（标签|数值）被少列
+    候选挤掉，"薪金、津贴和其他福利 19,872" 并成一格。
+    """
+    interior = edges[1:-1]
+    if not interior:
+        return 0
+    n = 0
+    for e in interior:
+        both = 0
+        for _y0, _y1, spans in rows:
+            left = any(x1 <= e + 2.0 and x1 >= e - 60.0 for x0, x1, _t in spans)
+            right = any(x0 >= e - 2.0 and x0 <= e + 60.0
+                        for x0, x1, _t in spans)
+            if left and right:
+                both += 1
+        n_rows = len(rows)
+        if n_rows and both >= 0.4 * n_rows:
+            n += 1
+    return n
+
+
 def rebuild_grid(page: fitz.Page, box: Rect,
                  col_edges: Optional[List[float]] = None,
                  src_cols: Optional[int] = None,
@@ -877,13 +933,18 @@ def rebuild_grid(page: fitz.Page, box: Rect,
         cands = [("gutter", cand_gutter)]
     best_name, edges = cands[0]
     best_rate = _span_crossing_rate(rows, edges)
+    best_sup = _edge_support(rows, edges)
     for name, cand in cands[1:]:
         rate = _span_crossing_rate(rows, cand)
-        # 平票取列数更少的候选：跨列率同为 0 时，多出来的边只可能是
-        # 行内空格上的假边界（幽灵空列的来源）
-        if rate < best_rate - 1e-9 or \
-                (abs(rate - best_rate) <= 1e-9 and len(cand) < len(edges)):
-            best_name, best_rate, edges = name, rate, cand
+        sup = _edge_support(rows, cand)
+        # 三级评判：穿过率低者优先；平票时有支撑边多者优先（宽留白
+        # 真界不穿字但承载结构）；再平票取列数更少（幽灵空列）
+        if rate < best_rate - 1e-9:
+            best_name, best_rate, best_sup, edges = name, rate, sup, cand
+        elif abs(rate - best_rate) <= 1e-9:
+            if sup > best_sup or (sup == best_sup
+                                  and len(cand) < len(edges)):
+                best_name, best_rate, best_sup, edges = name, rate, sup, cand
     n_cols = len(edges) - 1
     rules = _ruled_row_edges(page, box)
     row_edges = None
