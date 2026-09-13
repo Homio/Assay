@@ -232,7 +232,8 @@ def _span_is_bold(s: dict, stroke_keys: set) -> bool:
     return False
 
 
-def _merge_siblin_rows(lines: List[dict], em: float) -> List[dict]:
+def _merge_siblin_rows(lines: List[dict], em: float,
+                       page_w: float) -> List[dict]:
     """
     同一视觉行上的相邻 line 对象按 x 拼成一条逻辑行。
 
@@ -262,7 +263,8 @@ def _merge_siblin_rows(lines: List[dict], em: float) -> List[dict]:
             ptxt = p["text"].rstrip()
             prefix_like = len(ptxt) <= 4 or ptxt.endswith(("：", ":"))
             if (prefix_like or row_n == 2) \
-                    and abs(cy - pcy) <= 4.0 and -14.0 <= gap <= 100.0:
+                    and abs(cy - pcy) <= 0.33 * em \
+                    and -14.0 <= gap <= 0.17 * page_w:
                 joiner = " " if gap > 1.0 else ""
                 p["text"] = ptxt + joiner + l["text"].lstrip()
                 p["x1"] = max(p["x1"], l["x1"])
@@ -343,12 +345,13 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
         return False
 
     lines = [l for l in lines if not _is_pageno(l)]
-    lines = _merge_siblin_rows(lines, 12.0)
+    page_w = page.rect.width
 
     # em width ≈ median per-character advance (for the indent-shift test)
     advs = sorted((l["x1"] - l["x0"]) / len(l["text"]) for l in lines
                   if len(l["text"]) >= 4)
     em = advs[len(advs) // 2] if advs else 12.0
+    lines = _merge_siblin_rows(lines, em, page_w)
 
     # walk top-down with the RELATIVE-SHIFT paragraph rule: a line is a
     # NEW paragraph iff it is indented ~+2em RELATIVE TO THE PREVIOUS
@@ -358,7 +361,6 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
     # 短标签）也永不吸收。
     from collections import Counter
     ybucket = Counter(round(l["y0"] / 2.0) for l in lines)
-    page_w = page.rect.width
 
     paragraphs: List[List[dict]] = []
     cur: List[dict] = []
@@ -508,23 +510,50 @@ def _cell_bbox_to_rect(bbox_8: np.ndarray) -> Tuple[float, float, float, float]:
             float(np.max(xs)), float(np.max(ys)))
 
 
+def _median_char_size(chars: list) -> float:
+    sizes = sorted(c[6] for c in chars if len(c) > 6 and c[6] > 1)
+    return sizes[len(sizes) // 2] if sizes else 9.0
+
+
+def _table_scale(page: fitz.Page,
+                 table_bbox: Tuple[float, float, float, float]) -> float:
+    """区域文字中位字号——几何阈值的缩放基准（见 completion._table_scale）。"""
+    sizes = []
+    for block in page.get_text("dict",
+                               clip=fitz.Rect(*table_bbox))["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for s in line.get("spans", []):
+                t = s.get("text", "")
+                if t.strip() and s.get("size", 0) > 1:
+                    sizes.append(s["size"])
+    if not sizes:
+        return 9.0
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+
 def _table_char_index(page: fitz.Page,
                       table_bbox: Tuple[float, float, float, float]
-                      ) -> List[Tuple[float, float, float, float, str, float]]:
+                      ) -> List[Tuple[float, float, float, float, str, float, float]]:
     """Visible glyphs inside the table region as
     (x0, y0, x1, y1, char, line_y) — the atoms for best-overlap
     assignment.  clip 提取（get_text clip）会把任何与单元格相交的字形
     都算进去，相邻表头的首几个字（"2024"→"202"）、折行邻格的尾字
     （"民币"、""）因此串格；按字形归属才能根治。"""
+    scale = _table_scale(page, table_bbox)
+    pad = 0.45 * scale
     raw = page.get_text(
         "rawdict",
-        clip=fitz.Rect(table_bbox[0] - 4.0, table_bbox[1] - 4.0,
-                       table_bbox[2] + 4.0, table_bbox[3] + 4.0))
-    chars: List[Tuple[float, float, float, float, str, float]] = []
+        clip=fitz.Rect(table_bbox[0] - pad, table_bbox[1] - pad,
+                       table_bbox[2] + pad, table_bbox[3] + pad))
+    chars: List[Tuple[float, float, float, float, str, float, float]] = []
     for block in raw.get("blocks", []):
         for line in block.get("lines", []):
             ly0 = line["bbox"][1]
             for span in line.get("spans", []):
+                ssize = span.get("size", 0) or 9.0
                 for ch in span.get("chars", []):
                     c = ch.get("c", "")
                     if not c or not c.strip():
@@ -532,7 +561,7 @@ def _table_char_index(page: fitz.Page,
                     bx = ch.get("bbox", (0, 0, 0, 0))
                     if bx[2] <= bx[0] or bx[3] <= bx[1]:
                         continue
-                    chars.append((bx[0], bx[1], bx[2], bx[3], c, ly0))
+                    chars.append((bx[0], bx[1], bx[2], bx[3], c, ly0, ssize))
     return chars
 
 
@@ -546,7 +575,7 @@ def _chars_to_text(chars: List[Tuple[float, float, float, float, str, float]]
     parts: List[str] = []
     last_y = None
     last_x1 = None
-    for x0, y0, x1, y1, c, ly in chars:
+    for x0, y0, x1, y1, c, ly, _sz in chars:
         if last_y is not None:
             if ly - last_y > 3.0:
                 parts.append("\n")
@@ -690,8 +719,8 @@ def build_table_from_slanet(
                 assigned[best].append(ch)
                 continue
             # 最近格兜底：SLANet 窄格边缘的字形（"…31 日" 的"日"）中心
-            # 落在所有格之外 5pt 以内时归最近的格，避免边缘字丢失
-            best, best_dist = -1, 5.0
+            # 落在所有格之外 0.55×字号 以内时归最近的格，避免边缘字丢失
+            best, best_dist = -1, 0.55 * _median_char_size(all_chars)
             for ci, r in enumerate(cell_rects):
                 if r[2] <= r[0] or r[3] <= r[1]:
                     continue

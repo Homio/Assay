@@ -82,6 +82,43 @@ COL_CONFIRM_RATIO = 0.5     # ... and this share of the multi-span rows
 _WS_RE = re.compile(r"\s+")
 
 
+def _table_scale(page: fitz.Page, box: Rect) -> float:
+    """
+    区域文字的中位字号（pt）——所有几何阈值的缩放基准。
+
+    空格宽（≈0.25-0.3×字号）、格留白（≥0.45×字号）、字形压线量、
+    边缘漂移（按字符数计）都是字号的函数：绝对 pt 阈值在 9pt 的
+    中国石油上校准后，换到 14pt 或 7.5pt 密排的书就会翻转正副作用。
+    阈值一律写成 ×字号，比例值按 9-12pt 行为校准。
+    """
+    sizes = []
+    for block in page.get_text("dict", clip=fitz.Rect(*box))["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for s in line.get("spans", []):
+                t = s.get("text", "")
+                if t.strip() and s.get("size", 0) > 1:
+                    sizes.append(s["size"])
+    if not sizes:
+        return 9.0
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+
+def _table_scale_cached(page: fitz.Page, box: Rect) -> float:
+    key = (id(page), round(box[0]), round(box[1]),
+           round(box[2]), round(box[3]))
+    val = _SCALE_CACHE.get(key)
+    if val is None:
+        val = _table_scale(page, box)
+        _SCALE_CACHE[key] = val
+    return val
+
+
+_SCALE_CACHE: dict = {}
+
+
 def _norm(s: str) -> str:
     return _WS_RE.sub("", s or "")
 
@@ -196,8 +233,9 @@ def structure_suspect(page: fitz.Page, table_bbox: Optional[Rect],
         frags = _line_fragments(page, table_bbox)
         frags.sort(key=lambda f: f["cy"])
         bands: List[List[dict]] = []
+        s = _table_scale_cached(page, table_bbox)
         for f in frags:
-            if bands and f["cy"] - bands[-1][-1]["cy"] <= 3.0:
+            if bands and f["cy"] - bands[-1][-1]["cy"] <= 0.33 * s:
                 bands[-1].append(f)
             else:
                 bands.append([f])
@@ -299,14 +337,15 @@ def _split_violations(rows: list, edges: List[float]) -> int:
     return n
 
 
-def _grid_col_edges(cells: List[CellOutput]) -> List[float]:
+def _grid_col_edges(cells: List[CellOutput],
+                    scale: float = 9.0) -> List[float]:
     """Column boundary x-values of an existing grid (cell x-edges, merged
     at 3 pt tolerance), sorted."""
     xs = sorted({v for c in cells if c.bbox[2] > c.bbox[0]
                  for v in (c.bbox[0], c.bbox[2])})
     merged: List[float] = []
     for x in xs:
-        if merged and x - merged[-1] <= 3.0:
+        if merged and x - merged[-1] <= 0.33 * scale:
             continue
         merged.append(x)
     return merged
@@ -351,7 +390,8 @@ def _ruled_row_edges(page: fitz.Page, box: Rect) -> List[float]:
     return merged
 
 
-def _consolidate_col_edges(edges: List[float], src_cols: int) -> List[float]:
+def _consolidate_col_edges(edges: List[float], src_cols: int,
+                           scale: float = 9.0) -> List[float]:
     """
     Consolidate a drifted grid's scattered column edges back to
     ``src_cols + 1`` boundaries.
@@ -392,12 +432,13 @@ def _span_crossing_rate(bands: list, edges: List[float]) -> float:
     return bad / total if total else 0.0
 
 
-MIDPOINT_TOL = 10.0     # clustering tolerance for span-gap midpoints (pt)
+MIDPOINT_TOL = 1.1      # clustering tolerance for span-gap midpoints (×字号)
 MIDPOINT_ROWS = 0.35    # a boundary needs this share of multi-span rows
-MIDPOINT_MIN_GAP = 4.0  # 混排字体行内空格（2-3pt）不是列界（pt）
+MIDPOINT_MIN_GAP = 0.44 # 行内空格（0.25-0.3×字号）不是列界（×字号）
 
 
-def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
+def _span_midpoint_edges(rows: list, box: Rect,
+                         page: Optional[fitz.Page] = None) -> List[float]:
     """
     Column boundaries voted by the rows themselves: every multi-span row
     contributes the midpoints between its adjacent spans, and boundaries
@@ -412,6 +453,7 @@ def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
     （n_multi 少）里单行空格投票曾把日期表头劈成 "2024"+"年12 月31 日"
     两格并繁殖整列空列。确认票数下限 2——单行投票不足以立界。
     """
+    scale = _table_scale_cached(page, box) if page is not None else 9.0
     votes: List[float] = []
     n_multi = 0
     for _y0, _y1, spans in rows:
@@ -419,7 +461,7 @@ def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
             continue
         n_multi += 1
         for a, b in zip(spans, spans[1:]):
-            if b[0] - a[1] >= MIDPOINT_MIN_GAP:
+            if b[0] - a[1] >= MIDPOINT_MIN_GAP * scale:
                 votes.append((a[1] + b[0]) / 2)
     if not votes or n_multi < 3:
         return []
@@ -427,7 +469,7 @@ def _span_midpoint_edges(rows: list, box: Rect) -> List[float]:
     need = max(2, MIDPOINT_ROWS * n_multi)
     clusters: List[List[float]] = []
     for v in votes:
-        if clusters and v - clusters[-1][-1] <= MIDPOINT_TOL:
+        if clusters and v - clusters[-1][-1] <= MIDPOINT_TOL * scale:
             clusters[-1].append(v)
         else:
             clusters.append([v])
@@ -448,10 +490,12 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
     here — the paren glyph's centre sits 1.5 pt on the wrong side).
     """
     import bisect
-    # clip 四周外扩 4pt：检测框贴着边线，最后一列/最后一行的字形
+    # clip 外扩 0.45×字号：检测框贴着边线，最后一列/最后一行的字形
     # （"…人民币" 的 "币"）可能压线——clip 会把压线字形整体丢弃，
     # 造成格尾截断。外扩只影响字形采集，行列归属仍由格心决定
-    clip = fitz.Rect(box[0] - 4.0, box[1] - 4.0, box[2] + 4.0, box[3] + 4.0)
+    scale = _table_scale_cached(page, box)
+    pad = 0.45 * scale
+    clip = fitz.Rect(box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
     raw = page.get_text("rawdict", clip=clip)
     fragments: List[dict] = []
     for block in raw.get("blocks", []):
@@ -465,7 +509,7 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
                     if not c or c.isspace():
                         continue
                     bx = ch.get("bbox", (0, 0, 0, 0))
-                    if runs and bx[0] - runs[-1][-1][2] <= FRAG_GAP:
+                    if runs and bx[0] - runs[-1][-1][2] <= FRAG_GAP * scale:
                         runs[-1].append((bx[0], bx[1], bx[2], bx[3], c, skey))
                     else:
                         runs.append([(bx[0], bx[1], bx[2], bx[3], c, skey)])
@@ -479,7 +523,7 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
                 text = ""
                 prev_x1 = None
                 for c in run:
-                    if prev_x1 is not None and c[0] - prev_x1 > 1.2:
+                    if prev_x1 is not None and c[0] - prev_x1 > 0.13 * scale:
                         text += " "
                     text += c[4]
                     prev_x1 = c[2]
@@ -499,8 +543,8 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
     return fragments
 
 
-FRAG_GAP = 3.0         # inter-glyph gap that starts a new fragment (pt)
-GAPVOTE_MIN_GAP = 4.0  # 补边投票的最小片段间隙（pt）——行内空格不是列界
+FRAG_GAP = 0.33        # inter-glyph gap that starts a new fragment (×字号)
+GAPVOTE_MIN_GAP = 0.44 # 补边投票的最小片段间隙（×字号）——行内空格不是列界
 SPAN_CELL_WIDTH = 1.5  # a fragment this many columns wide is a spanning
                        # header cell, not column content
 
@@ -529,6 +573,7 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
     n_r, n_c = len(row_edges) - 1, len(col_edges) - 1
     colw = (col_edges[-1] - col_edges[0]) / max(1, n_c)
     keep = set(keep_rows) if keep_rows is not None else set(range(n_r))
+    scale = _table_scale_cached(page, box)
     frags = _line_fragments(page, box)
 
     def _col_of(x: float) -> int:
@@ -569,7 +614,7 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
             for j in range(lo_j, hi_j + 1):
                 g = chars[j][1] - chars[j - 1][2]
                 mid = (chars[j - 1][2] + chars[j][1]) / 2.0
-                if abs(mid - edge) <= 10.0 and g > best_w:
+                if abs(mid - edge) <= 1.1 * scale and g > best_w:
                     best_w, best_i = g, j
             if best_i is not None:
                 cuts.append(best_i)
@@ -621,12 +666,13 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
         n_multi += 1
         for a, b in zip(rfs, rfs[1:]):
             gap = b["x0"] - a["x1"]
-            if gap >= GAPVOTE_MIN_GAP:
+            if gap >= GAPVOTE_MIN_GAP * scale:
                 mid = (a["x1"] + b["x0"]) / 2.0
                 # ±10pt: 右对齐数值列的参差空白（gap 中点每行漂移
                 # 十余 pt）不算缺失边界——附近已有边界即认账；真正的
                 # 缺失边界（p8 追溯后/追溯前，缺口 20pt+）仍会投票
-                if not any(abs(mid - e) <= 10.0 for e in col_edges[1:-1]):
+                if not any(abs(mid - e) <= 1.1 * scale
+                           for e in col_edges[1:-1]):
                     gap_mids.append(mid)
     need_votes = max(2, round(0.3 * n_multi))
     gap_mids.sort()
@@ -634,7 +680,7 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
     for m in gap_mids:
         # 单链聚类（6pt）：右对齐数值起点每行漂 3-6pt，按 5pt 硬桶
         # 会把票劈进相邻桶导致不足阈值
-        if clusters and m - clusters[-1][-1] <= 6.0:
+        if clusters and m - clusters[-1][-1] <= 0.6 * scale:
             clusters[-1].append(m)
         else:
             clusters.append([m])
@@ -697,9 +743,9 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
             last_y = None
             last_x1 = None
             for f in fs:
-                if last_y is not None and f["y0"] - last_y > 3.0:
+                if last_y is not None and f["y0"] - last_y > 0.33 * scale:
                     parts.append("\n")
-                elif last_x1 is not None and f["x0"] - last_x1 > 1.2:
+                elif last_x1 is not None and f["x0"] - last_x1 > 0.13 * scale:
                     # 同行拆出的子段间隙 >1.2pt → 词间空格
                     parts.append(" ")
                 parts.append(f["text"])
@@ -719,7 +765,7 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
 # ── Wrapped-label band merge（三线表折行标签） ─────────────────────────────
 
 WRAP_FILL = 0.62       # 折行首行顶满标签列宽度的比例阈值
-WRAP_LEFT_TOL = 15.0   # 续行起始 x 与标签列左缘的容差（pt）
+WRAP_LEFT_TOL = 1.7    # 续行起始 x 与标签列左缘的容差（×字号）
 _WRAP_COMPLETE_END = re.compile(r'[：:；;。．）)％%]$|\d$|\d\s*日$')
 _WRAP_ENUM_PREFIX = (
     re.compile(r'^[（(]?\d{1,3}[.．](?!\d)\s*\S'),          # 1. / 3．内容
@@ -792,7 +838,8 @@ def _wrap_veto(t1: str, t2: str) -> bool:
     return False
 
 
-def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
+def _merge_wrapped_label_bands(rows: list, edges: List[float],
+                               scale: float = 9.0) -> list:
     """
     三线表（无行线）的折行标签修复：一个逻辑行的标签太长被折成两行、
     数值与标签末行底部对齐时，文本带把一行拆成两行——首行只有标签
@@ -838,7 +885,8 @@ def _merge_wrapped_label_bands(rows: list, edges: List[float]) -> list:
         while (j < len(rows)
                and label_only_fills(cur)
                and has_value_frags(rows[j])
-               and min(x0 for x0, x1, _t in rows[j][2]) <= lx0 + WRAP_LEFT_TOL
+               and min(x0 for x0, x1, _t in rows[j][2])
+               <= lx0 + WRAP_LEFT_TOL * scale
                and not _wrap_veto(
                    ''.join(s[2] for s in sorted(cur[2])),
                    min(rows[j][2], key=lambda s: s[0])[2])):
@@ -861,12 +909,14 @@ def _edge_support(rows: list, edges: List[float]) -> int:
     interior = edges[1:-1]
     if not interior:
         return 0
+    win = 0.14 * max(1.0, edges[-1] - edges[0])
     n = 0
     for e in interior:
         both = 0
         for _y0, _y1, spans in rows:
-            left = any(x1 <= e + 2.0 and x1 >= e - 60.0 for x0, x1, _t in spans)
-            right = any(x0 >= e - 2.0 and x0 <= e + 60.0
+            left = any(x1 <= e + 2.0 and x1 >= e - win
+                       for x0, x1, _t in spans)
+            right = any(x0 >= e - 2.0 and x0 <= e + win
                         for x0, x1, _t in spans)
             if left and right:
                 both += 1
@@ -898,6 +948,7 @@ def rebuild_grid(page: fitz.Page, box: Rect,
     Returns (cells, num_rows, num_cols, col_edges, rows).
     """
     rows = _rows(page, box)
+    scale = _table_scale_cached(page, box)
     if not rows:
         return [], 0, 0, [box[0], box[2]], []
 
@@ -912,9 +963,9 @@ def rebuild_grid(page: fitz.Page, box: Rect,
     if col_edges and len(col_edges) >= 2:
         cand_hint = _clamp(col_edges)
         if src_cols is not None:
-            cand_hint = _consolidate_col_edges(cand_hint, src_cols)
+            cand_hint = _consolidate_col_edges(cand_hint, src_cols, scale)
     cand_gutter = _clamp(_column_edges(rows, box[0], box[2]))
-    cand_mid = _clamp(_span_midpoint_edges(rows, box))
+    cand_mid = _clamp(_span_midpoint_edges(rows, box, page))
 
     cands = [("hint", cand_hint), ("gutter", cand_gutter),
              ("midpoint", cand_mid)]
@@ -968,7 +1019,8 @@ def rebuild_grid(page: fitz.Page, box: Rect,
             # 唯一例外是折行标签（前带仅标签列有墨迹且不是结构性收尾
             # 行），它并入后带；"归属于："这类冒号收尾的结构行独立成行
             def _has_value_ink(band) -> bool:
-                return any(x1 > edges[1] + 2.0 for x0, x1, _t in band[2])
+                return any(x1 > edges[1] + 0.22 * scale
+                           for x0, x1, _t in band[2])
 
             def _structural_end(band) -> bool:
                 t = "".join(s[2] for s in sorted(band[2])).rstrip()
@@ -1008,7 +1060,7 @@ def rebuild_grid(page: fitz.Page, box: Rect,
         intervals = list(zip(yb, yb[1:]))
         n_rows = len(rows)
         row_edges = yb
-        rows = _merge_wrapped_label_bands(rows, edges)
+        rows = _merge_wrapped_label_bands(rows, edges, scale)
         if len(rows) != len(intervals):
             # recompute boundaries from the merged band set
             yb = [box[1]]
@@ -1083,7 +1135,9 @@ def complete_table(page: fitz.Page,
         return cells, num_rows, num_cols, False
 
     new_cells, new_rows, new_cols, new_edges, rows = rebuild_grid(
-        page, table_bbox, col_edges=_grid_col_edges(cells),
+        page, table_bbox,
+        col_edges=_grid_col_edges(
+            cells, _table_scale_cached(page, table_bbox)),
         src_cols=num_cols)
     if not new_cells:
         return cells, num_rows, num_cols, False
@@ -1101,7 +1155,9 @@ def complete_table(page: fitz.Page,
     # text spans than the rebuild's.  A genuine SLANet grid (edges in
     # gutters, 0 violations) is never replaced by a poorer-columned one.
     if new_cols < num_cols:
-        old_viol = _split_violations(rows, _grid_col_edges(cells))
+        old_viol = _split_violations(
+            rows, _grid_col_edges(
+                cells, _table_scale_cached(page, table_bbox)))
         new_viol = _split_violations(rows, new_edges)
         if old_viol <= new_viol:
             _log.debug(f"completion declined (cols {num_cols}→{new_cols}, "
