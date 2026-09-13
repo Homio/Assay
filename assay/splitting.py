@@ -94,12 +94,19 @@ def _rows(page, box: Rect) -> List[list]:
     lines.sort()
     rows: List[list] = []
     for ly0, ly1, lx0, lx1, txt in lines:
-        if rows and ly0 <= rows[-1][1] - 2.0:   # vertical overlap => same row
-            rows[-1][0] = min(rows[-1][0], ly0)
-            rows[-1][1] = max(rows[-1][1], ly1)
-            rows[-1][2].append((lx0, lx1, txt))
-        else:
-            rows.append([ly0, ly1, [(lx0, lx1, txt)]])
+        # vertical overlap => same row.  重叠量按行高相对化：绝对 2pt
+        # 是 12pt 字排版下的 0.2 行高，平安 10pt 字的行距更紧——基线
+        # 错位仅 0.9-2.1pt 的相邻数据行（标签行与数值行）会被它并成
+        # 一个带，三个逻辑行吸进两个带（一格两数的根源）
+        if rows:
+            overlap = rows[-1][1] - ly0
+            avg_h = 0.5 * ((rows[-1][1] - rows[-1][0]) + (ly1 - ly0))
+            if overlap >= 0.2 * avg_h:
+                rows[-1][0] = min(rows[-1][0], ly0)
+                rows[-1][1] = max(rows[-1][1], ly1)
+                rows[-1][2].append((lx0, lx1, txt))
+                continue
+        rows.append([ly0, ly1, [(lx0, lx1, txt)]])
     for r in rows:
         r[2].sort()
     return rows
