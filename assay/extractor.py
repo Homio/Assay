@@ -132,7 +132,8 @@ def _is_page_header(text: str) -> bool:
 
 def _detect_heading_label(text: str, max_font: float,
                           is_bold: bool = False,
-                          left_aligned: bool = True) -> str:
+                          left_aligned: bool = True,
+                          _body_em: float = 12.0) -> str:
     """
     Classify text as heading based on structural patterns and font size.
 
@@ -170,7 +171,7 @@ def _detect_heading_label(text: str, max_font: float,
         # "12、报告期后事项"、"审计师确认"、"意见的基础" 都靠它识别。
         # 句号收尾的粗体行是强调句不是标题
         return "subsection_heading"
-    if max_font >= 16 and text_len <= 40:
+    if max_font >= 1.33 * _body_em and text_len <= 40:
         return "section_heading"
     return "text"
 
@@ -340,7 +341,7 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
         if re.match(r'^[-·•—–]\s*\d{1,3}\s*[-—]\s*$', t):
             return True
         if re.fullmatch(r'[-·•—–\s]*\d{1,3}[-—]?', t) \
-                and l["y0"] > page_h - 72:
+                and l["y0"] > page_h * 0.915:
             return True
         return False
 
@@ -459,6 +460,7 @@ def extract_page_text(page: fitz.Page, page_idx: int) -> List[TextOutput]:
         label = _detect_heading_label(
             full_text, max_font,
             is_bold=all(l["bold"] for l in para),
+            _body_em=em,
             left_aligned=px0 <= 0.45 * page_w)
         outputs.append(TextOutput(
             text=full_text, page_no=page_idx, label=label,

@@ -227,6 +227,13 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
     barea = (bx1 - bx0) * (by1 - by0)
     bn = re.sub(r"\s+", "", text.text)
     for table in tables:
+        # 表格自身的布局尺度 = 中位格高（随排版密度缩放，不依赖字号）
+        th = getattr(table, "_row_h", None)
+        if th is None:
+            hs = sorted(c.bbox[3] - c.bbox[1] for c in table.cells
+                        if 1.0 < c.bbox[3] - c.bbox[1] < 200)
+            th = hs[len(hs) // 2] if hs else 12.0
+            table._row_h = th
         inter = 0.0
         gx0 = gy0 = gx1 = gy1 = None
         for c in table.cells:
@@ -258,8 +265,8 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
             if ix1 > ix0 and iy1 > iy0 \
                     and (ix1 - ix0) * (iy1 - iy0) >= 0.9 * barea:
                 return True
-            if bn and len(bn) >= 2 and by0 >= tb[3] - 5.0 \
-                    and by0 <= tb[3] + 60.0:
+            if bn and len(bn) >= 2 and by0 >= tb[3] - 0.3 * th \
+                    and by0 <= tb[3] + 3.0 * th:
                 cached = getattr(table, "_norm_cells_cache", None)
                 if cached is None:
                     cached = re.sub(r"\s+", "",
