@@ -641,9 +641,21 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
                 merged.append((ci, text, px0, px1))
         return merged
 
-    # group fragments per row interval (by fragment vertical centre)
+    # group fragments per row interval (by fragment vertical centre).
+    # 带外丢弃：fragment 中心落在网格上/下沿之外（表格上方的表外行，
+    # 如平安 "（货币单位：人民币百万元）" 距首行带 5pt）时 clamp 会把
+    # 它错误吸进首/末行——丢弃而不是 clamp
+    top_y, bot_y = row_edges[0], row_edges[-1]
+    row_h = min((b - a for a, b in zip(row_edges, row_edges[1:])),
+                default=12.0)
     by_row: dict = {}
     for f in frags:
+        # 上沿带外丢弃：表格上方的表外行（平安 "（货币单位：人民币
+        # 百万元）" 距首行带 5pt）clamp 会错误吸进首行。下沿不丢——
+        # 检测框常把最后一行截在框外（石油 p271 尾行 174,640 在框底
+        # 外 6pt），那是表格内容，clamp 进末行
+        if f["cy"] < top_y - 0.3 * row_h:
+            continue
         ri = min(max(bisect.bisect_right(row_edges, f["cy"]) - 1,
                      0), n_r - 1)
         by_row.setdefault(ri, []).append(f)

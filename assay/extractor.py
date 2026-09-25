@@ -745,6 +745,15 @@ def build_table_from_slanet(
         cell_meta.append((start_row, end_row, start_col, end_col, pdf_bbox))
         cell_rects.append(pdf_bbox)
 
+    # 列包络：同列所有格的 x 并集。右对齐列的表头格居中而数据值右探，
+    # SLANet 表头格右界普遍比列的真实右界窄（"2023 年 12 月 31 日"
+    # 尾字 '日'、"人民币" 尾字 '币' 落在格外 8-20pt）——按列包络归属
+    # 而非单格 bbox，尾字回到本列表头格
+    col_env: dict = {}
+    for (_sr, _er, sc, _ec, r) in cell_meta:
+        lo, hi = col_env.get(sc, (r[0], r[2]))
+        col_env[sc] = (min(lo, r[0]), max(hi, r[2]))
+
     assigned: List[List] = [[] for _ in range(n_cells)]
     if all_chars and cell_rects:
         areas = [(r[2] - r[0]) * (r[3] - r[1])
@@ -764,8 +773,10 @@ def build_table_from_slanet(
             for ci, r in enumerate(cell_rects):
                 if r[3] + 2 < cy or r[1] - 2 > cy:
                     continue
-                ix0, iy0 = max(ch[0], r[0]), max(ch[1], r[1])
-                ix1, iy1 = min(ch[2], r[2]), min(ch[3], r[3])
+                env = col_env.get(cell_meta[ci][2], (r[0], r[2]))
+                ex0, ex1 = min(r[0], env[0]), max(r[2], env[1])
+                ix0, iy0 = max(ch[0], ex0), max(ch[1], r[1])
+                ix1, iy1 = min(ch[2], ex1), min(ch[3], r[3])
                 if ix1 <= ix0 or iy1 <= iy0:
                     continue
                 score = (ix1 - ix0) * (iy1 - iy0) / carea
@@ -775,12 +786,20 @@ def build_table_from_slanet(
                 assigned[best].append(ch)
                 continue
             # 最近格兜底：SLANet 窄格边缘的字形（"…31 日" 的"日"）中心
-            # 落在所有格之外 0.55×字号 以内时归最近的格，避免边缘字丢失
-            best, best_dist = -1, 0.55 * _median_char_size(all_chars)
+            # 落在所有格之外 0.55×字号 以内时归最近的格，避免边缘字丢失。
+            # 仅限横向压线：字形 y 中心必须仍在格的 y 范围 ±0.25×字号 内——
+            # 表格上方的表外行（平安 "（货币单位：人民币百万元）" 紧贴表头
+            # 上沿，距最近格 5pt）纵向兜进表头会把单位行拆碎注入两格
+            cs = 0.55 * _median_char_size(all_chars)
+            best, best_dist = -1, cs
             for ci, r in enumerate(cell_rects):
                 if r[2] <= r[0] or r[3] <= r[1]:
                     continue
-                dx = max(r[0] - cx, 0.0, cx - r[2])
+                if not (r[1] - 0.25 * cs <= cy <= r[3] + 0.25 * cs):
+                    continue
+                env = col_env.get(cell_meta[ci][2], (r[0], r[2]))
+                ex0, ex1 = min(r[0], env[0]), max(r[2], env[1])
+                dx = max(ex0 - cx, 0.0, cx - ex1)
                 dy = max(r[1] - cy, 0.0, cy - r[3])
                 d = (dx * dx + dy * dy) ** 0.5
                 if d < best_dist:

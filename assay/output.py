@@ -258,15 +258,27 @@ def _is_table_text(text: TextOutput, tables: List[TableOutput]) -> bool:
             if ix1 > ix0 and iy1 > iy0 \
                     and (ix1 - ix0) * (iy1 - iy0) >= 0.5 * barea:
                 return True
-        tb = table.table_bbox
-        if tb and tb[2] > tb[0] and tb[3] > tb[1]:
-            ix0, iy0 = max(bx0, tb[0]), max(by0, tb[1])
-            ix1, iy1 = min(bx1, tb[2]), min(by1, tb[3])
+        # detection-box containment 收窄为 cell-union containment：
+        # 检测框常比网格多包住表标题行（平安 "现金分红政策的专项说明"
+        # 在框内、首行带外）——按框过滤会把这行吞掉，按格并集过滤则
+        # 放行给正文。网格上沿贴上方的短行（表标题）同样放行：它压着
+        # 首行格却不是表内容
+        if gx0 is not None and gx1 > gx0 and gy1 > gy0:
+            # 网格头两行带之间的孤立短行（表标题压着折行表头区）：
+            # 高度 < 0.7×中位格高且不进入第三行带 → 放行为正文
+            ys_sorted = sorted(c.bbox[1] for c in table.cells
+                               if c.bbox[3] > c.bbox[1])
+            if len(ys_sorted) >= 3:
+                band2 = ys_sorted[len(ys_sorted) // 3]
+                if by1 - by0 < 0.7 * th and (by0 + by1) / 2 < band2:
+                    continue
+            ix0, iy0 = max(bx0, gx0), max(by0, gy0)
+            ix1, iy1 = min(bx1, gx1), min(by1, gy1)
             if ix1 > ix0 and iy1 > iy0 \
                     and (ix1 - ix0) * (iy1 - iy0) >= 0.9 * barea:
                 return True
-            if bn and len(bn) >= 2 and by0 >= tb[3] - 0.3 * th \
-                    and by0 <= tb[3] + 3.0 * th:
+            if bn and len(bn) >= 2 and by0 >= gy1 - 0.3 * th \
+                    and by0 <= gy1 + 3.0 * th:
                 cached = getattr(table, "_norm_cells_cache", None)
                 if cached is None:
                     cached = re.sub(r"\s+", "",
