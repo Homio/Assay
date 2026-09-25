@@ -133,7 +133,8 @@ def _is_page_header(text: str) -> bool:
 def _detect_heading_label(text: str, max_font: float,
                           is_bold: bool = False,
                           left_aligned: bool = True,
-                          _body_em: float = 12.0) -> str:
+                          _body_em: float = 12.0,
+                          _p90: float = 12.0) -> str:
     """
     Classify text as heading based on structural patterns and font size.
 
@@ -170,14 +171,14 @@ def _detect_heading_label(text: str, max_font: float,
         # 附注节标题 "34. 盈余公积"：编号+短名词、无句末标点、
         # 标题部分无数字格式（数值句 "1.6 万" 会带）——不依赖粗体
         return "section_heading"
-    if is_bold and left_aligned and text_len <= 40 \
+    if is_bold and 2 <= text_len <= 40 \
             and not text.endswith(('。', '：', ':')) \
             and not re.fullmatch(r'[（(][^）)]{0,6}[）)]|\d[\d.、]*', text):
         # 描边假粗体（fill+stroke 双重渲染）是本报告标题的通用签名：
         # "12、报告期后事项"、"审计师确认"、"意见的基础" 都靠它识别。
         # 句号收尾的粗体行是强调句不是标题
         return "subsection_heading"
-    if max_font >= 1.33 * _body_em and text_len <= 40:
+    if max_font >= 1.25 * _p90 and text_len <= 40:
         return "section_heading"
     return "text"
 
@@ -401,6 +402,12 @@ def extract_page_text(page: fitz.Page, page_idx: int,
                   if len(l["text"]) >= 4)
     em = advs[len(advs) // 2] if advs else 12.0
     lines = _merge_siblin_rows(lines, em, page_w)
+    # 页内字号 90 分位：表格注释密集页的全页中位会被小字拖低，使
+    # 8pt 注释超过 1.33×em 而成幽灵标题（平安 '## 注1：…'）。大字号
+    # 标题判据改用分布头部——正文主导字号之上的 25% 余量
+    size_sorted = sorted(l["size"] for l in lines if l["size"] > 1)
+    p90_size = size_sorted[int(0.9 * (len(size_sorted) - 1))] \
+        if size_sorted else 12.0
 
     # walk top-down with the RELATIVE-SHIFT paragraph rule: a line is a
     # NEW paragraph iff it is indented ~+2em RELATIVE TO THE PREVIOUS
@@ -514,7 +521,7 @@ def extract_page_text(page: fitz.Page, page_idx: int,
         label = _detect_heading_label(
             full_text, max_font,
             is_bold=all(l["bold"] for l in para),
-            _body_em=em,
+            _body_em=em, _p90=p90_size,
             left_aligned=px0 <= 0.45 * page_w)
         outputs.append(TextOutput(
             text=full_text, page_no=page_idx, label=label,
