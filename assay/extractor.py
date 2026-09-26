@@ -135,7 +135,8 @@ def _detect_heading_label(text: str, max_font: float,
                           left_aligned: bool = True,
                           _body_em: float = 12.0,
                           _p90: float = 12.0,
-                          _short_head: bool = False) -> str:
+                          _short_head: bool = False,
+                          _unit_word: bool = False) -> str:
     """
     Classify text as heading based on structural patterns and font size.
 
@@ -179,7 +180,7 @@ def _detect_heading_label(text: str, max_font: float,
         # 顶格短行块（左缘贴正文边距、单行、无句末标点）——渲染无差异
         # 时的最后结构信号。右对齐落款/单位行/勾选框均已排除
         return "subsection_heading"
-    if is_bold and 2 <= text_len <= 40 \
+    if is_bold and 2 <= text_len <= 40 and not _unit_word \
             and not text.endswith(('。', '：', ':')) \
             and not re.fullmatch(r'[（(][^）)]{0,6}[）)]|\d[\d.、]*', text):
         # 描边假粗体（fill+stroke 双重渲染）是本报告标题的通用签名：
@@ -482,10 +483,12 @@ def extract_page_text(page: fitz.Page, page_idx: int,
                       and -3.5 * line_h <= shift < 1.2 * em
                       and any(rx.match(l["text"])
                               for rx in _WRAP_ENUM_PREFIX))
-        # 空行断段：当前行与前一物理行之间有超过 1.8×字号 的垂直间隙
-        # （空行分段的约定），不是折行续行
+        # 空行断段：当前行与前一物理行之间有超过 2.2×行高 的垂直
+        # 间隙（空行分段的约定），不是折行续行——阈值用行高，em 会被
+        # 表格小字拖低（紫光 '…公司持'/'续经营…' 折行 gap 12pt 被
+        # em=6.5 下的 11.7pt 阈值误断）
         gap_break = cur and not row_frag \
-            and (l["y0"] - cur[-1]["y1"]) > 1.8 * em
+            and (l["y0"] - cur[-1]["y1"]) > 2.2 * max(1.0, l["y1"] - l["y0"])
         # 短行断段：前行句号收尾 + 本行顶格短行（宽<0.35 页宽、非枚举
         # 头/纯数字）——平安附注小标题与正文渲染完全同字体同字号、行距
         # 无差异，短行是唯一结构信号
@@ -497,13 +500,24 @@ def extract_page_text(page: fitz.Page, page_idx: int,
                        and not re.fullmatch(r'[-—·\s]*\d{1,3}[-—]?', l["text"])
                        and len(l["text"]) <= 20
                        and not l["text"].startswith(("（货币单位", "(货币单位")))
+        # 句中断行必合并：前行以非句末标点收尾（且非枚举头）时，本行
+        # 是同段折行续行——块首行窄（cur_starts_wide=False）也不能漏并
+        # fold 仅当前行接近通栏（>0.4 页宽）时生效——窄短行（'短期薪酬'
+        # 等小标题）虽以非句末标点结尾也不是"句中折行"，不能把正文吸进
+        prev_open = cur and not prev_final and cur[-1]["text"].rstrip()[-1:] \
+            not in "：:）、】」”" \
+            and (cur[-1]["x1"] - cur[-1]["x0"]) > 0.4 * page_w
+        fold = (cur and prev_open and not row_frag and same_style
+                and abs(shift if shift is not None else 0) < 3.5 * line_h
+                and not any(rx.match(l["text"])
+                            for rx in _WRAP_ENUM_PREFIX))
         # 短枚举行（"（1）截至…证券发行情况"、列表项单行）：不吸收
         # 后续行——标题/条目各自成段；顶满行宽的枚举行是折行条目的
         # 首行，续行照常并入
         enum_head = cur and len(cur_text) <= 40 \
             and any(rx.match(cur_text) for rx in _WRAP_ENUM_PREFIX) \
             and cur[-1]["x1"] < 0.82 * page_w
-        if cur and (cur_starts_wide or bare_marker) and not row_frag \
+        if cur and (cur_starts_wide or bare_marker or fold) and not row_frag \
                 and not new_para and same_style and not intro_colon \
                 and not dot_leader and not bold_flip and not enum_break \
                 and not toc_end and not label_colon and not enum_head \
@@ -517,8 +531,11 @@ def extract_page_text(page: fitz.Page, page_idx: int,
     if cur:
         paragraphs.append(cur)
 
+    def _width(pp) -> float:
+        return max(x["x1"] for x in pp) - min(x["x0"] for x in pp)
+
     outputs: List[TextOutput] = []
-    for para in paragraphs:
+    for pi, para in enumerate(paragraphs):
         para.sort(key=lambda l: ((l["y0"] + l["y1"]) / 2.0, l["x0"]))
         full_text = ""
         for l in para:
@@ -547,12 +564,23 @@ def extract_page_text(page: fitz.Page, page_idx: int,
         if _is_page_header(full_text):
             continue
         max_font = max(l["size"] for l in para)
+        prev_wide = pi > 0 and _width(paragraphs[pi - 1]) >= 0.5 * page_w
+        next_wide = pi + 1 < len(paragraphs) \
+            and _width(paragraphs[pi + 1]) >= 0.5 * page_w
+        _unit_word = bool(re.fullmatch(
+            r'[（(]?[\d.,，%\s]*'
+            r'(人民币千元|人民币百万元|美元千元|人民币元|万美元'
+            r'|人民币|外币|美元|港元|港币|欧元|日元|万元|千元|百万元|亿元|元|股)?'
+            r'[\d.,，%\s]*[）)]?(年度|年|月|日)?', full_text)) \
+            and len(full_text) <= 12
         label = _detect_heading_label(
             full_text, max_font,
             is_bold=all(l["bold"] for l in para),
             _body_em=em, _p90=p90_size,
             _short_head=(len(para) == 1 and para[0]["x0"] <= 0.20 * page_w
-                         and (para[0]["x1"] - para[0]["x0"]) < 0.35 * page_w),
+                         and (para[0]["x1"] - para[0]["x0"]) < 0.35 * page_w
+                         and (prev_wide or next_wide)),
+            _unit_word=_unit_word,
             left_aligned=px0 <= 0.45 * page_w)
         outputs.append(TextOutput(
             text=full_text, page_no=page_idx, label=label,
