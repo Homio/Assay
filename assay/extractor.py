@@ -134,7 +134,8 @@ def _detect_heading_label(text: str, max_font: float,
                           is_bold: bool = False,
                           left_aligned: bool = True,
                           _body_em: float = 12.0,
-                          _p90: float = 12.0) -> str:
+                          _p90: float = 12.0,
+                          _short_head: bool = False) -> str:
     """
     Classify text as heading based on structural patterns and font size.
 
@@ -165,12 +166,19 @@ def _detect_heading_label(text: str, max_font: float,
         if len(content_after) >= 2 and digit_groups <= 2 \
                 and not content_after.endswith('。'):
             return "subsection_heading"
-    m_num = re.match(r'^(\d{1,3})[.．]\s*(\S[^。；]{1,20})$', text)
+    m_num = re.match(r'^(\d{1,3})[.．]\s*(\S[^。；]{1,30})$', text)
     if m_num and not text.endswith(('。', '；', '：', ':')) \
             and not re.search(r'\d[.,，%]', m_num.group(2)):
         # 附注节标题 "34. 盈余公积"：编号+短名词、无句末标点、
         # 标题部分无数字格式（数值句 "1.6 万" 会带）——不依赖粗体
         return "section_heading"
+    if _short_head and 2 <= text_len <= 30 \
+            and not text.endswith(('。', '；', '：', ':', '，', ',')) \
+            and not re.match(r'^[□√■●◆•○□▪]', text) \
+            and not re.fullmatch(r'[（(][^）)]{0,6}[）)]', text):
+        # 顶格短行块（左缘贴正文边距、单行、无句末标点）——渲染无差异
+        # 时的最后结构信号。右对齐落款/单位行/勾选框均已排除
+        return "subsection_heading"
     if is_bold and 2 <= text_len <= 40 \
             and not text.endswith(('。', '：', ':')) \
             and not re.fullmatch(r'[（(][^）)]{0,6}[）)]|\d[\d.、]*', text):
@@ -220,10 +228,13 @@ def _stroke_bold_keys(page: fitz.Page) -> set:
 
 
 def _span_is_bold(s: dict, stroke_keys: set) -> bool:
+    """标题强调判定：粗体位 / 字体名 / 描边渲染 / 斜体位。斜体是与
+    粗体正交的渲染属性——平安附注的小标题（'后续计量''短期薪酬'）
+    全部以斜体排版，石油书无斜体标题，互不干扰。"""
     t = s.get("text", "")
     if not t.strip():
         return False
-    if s.get("flags", 0) & 16 or "bold" in s.get("font", "").lower():
+    if s.get("flags", 0) & (16 | 2) or "bold" in s.get("font", "").lower():
         return True
     font, size = s.get("font", ""), round(s.get("size", 0), 1)
     if (font, size, t) in stroke_keys:
@@ -458,16 +469,34 @@ def extract_page_text(page: fitz.Page, page_idx: int,
             and not intro_colon
         # 编号节标题（平安附注 "34. 盈余公积" 形状：编号+短名词、
         # 无句末标点）独立成块——不依赖粗体的标题结构信号
-        _mt = re.match(r'^\d{1,3}[.．]\s*(\S{1,12})$', l["text"])
+        _mt = re.match(r'^\d{1,3}[.．]\s*(\S{1,30})$', l["text"])
         numtitle = bool(_mt) and "." not in _mt.group(1) \
-            and "．" not in _mt.group(1)
+            and "．" not in _mt.group(1) \
+            and not l["text"].rstrip()[-1:] in "。；！？!?" 
         # 枚举断段：上一行以句末标点收尾、本行以编号/项目符号开头
         # （"……(2) 香港中央结算…" 注释条目各自成段）
         prev_final = cur and cur[-1]["text"].rstrip()[-1:] in "。；！？!?"
+        # 悬挂缩进窗口用当前行自身行高（em 中位会被表格小字拖低）
+        line_h = max(1.0, l["y1"] - l["y0"])
         enum_break = (prev_final and not new_para and shift is not None
-                      and abs(shift) < 1.2 * em
+                      and -3.5 * line_h <= shift < 1.2 * em
                       and any(rx.match(l["text"])
                               for rx in _WRAP_ENUM_PREFIX))
+        # 空行断段：当前行与前一物理行之间有超过 1.8×字号 的垂直间隙
+        # （空行分段的约定），不是折行续行
+        gap_break = cur and not row_frag \
+            and (l["y0"] - cur[-1]["y1"]) > 1.8 * em
+        # 短行断段：前行句号收尾 + 本行顶格短行（宽<0.35 页宽、非枚举
+        # 头/纯数字）——平安附注小标题与正文渲染完全同字体同字号、行距
+        # 无差异，短行是唯一结构信号
+        short_break = (prev_final and not row_frag
+                       and (l["x1"] - l["x0"]) < 0.35 * page_w
+                       and l["x0"] <= 0.25 * page_w
+                       and not any(rx.match(l["text"])
+                                   for rx in _WRAP_ENUM_PREFIX)
+                       and not re.fullmatch(r'[-—·\s]*\d{1,3}[-—]?', l["text"])
+                       and len(l["text"]) <= 20
+                       and not l["text"].startswith(("（货币单位", "(货币单位")))
         # 短枚举行（"（1）截至…证券发行情况"、列表项单行）：不吸收
         # 后续行——标题/条目各自成段；顶满行宽的枚举行是折行条目的
         # 首行，续行照常并入
@@ -478,7 +507,7 @@ def extract_page_text(page: fitz.Page, page_idx: int,
                 and not new_para and same_style and not intro_colon \
                 and not dot_leader and not bold_flip and not enum_break \
                 and not toc_end and not label_colon and not enum_head \
-                and not numtitle:
+                and not numtitle and not gap_break and not short_break:
             cur.append(l)               # continuation line
         else:
             if cur:
@@ -522,6 +551,8 @@ def extract_page_text(page: fitz.Page, page_idx: int,
             full_text, max_font,
             is_bold=all(l["bold"] for l in para),
             _body_em=em, _p90=p90_size,
+            _short_head=(len(para) == 1 and para[0]["x0"] <= 0.20 * page_w
+                         and (para[0]["x1"] - para[0]["x0"]) < 0.35 * page_w),
             left_aligned=px0 <= 0.45 * page_w)
         outputs.append(TextOutput(
             text=full_text, page_no=page_idx, label=label,
