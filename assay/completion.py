@@ -551,7 +551,8 @@ SPAN_CELL_WIDTH = 1.5  # a fragment this many columns wide is a spanning
 
 def _cells_from_fragments(page: fitz.Page, box: Rect,
                           row_edges: List[float], col_edges: List[float],
-                          keep_rows: Optional[List[int]] = None
+                          keep_rows: Optional[List[int]] = None,
+                          bleed_map: Optional[dict] = None
                           ) -> Tuple[List[CellOutput], List[float]]:
     """
     Build cells by assigning VALUE FRAGMENTS to the row/col interval
@@ -617,8 +618,24 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
                 if abs(mid - edge) <= 1.1 * scale and g > best_w:
                     best_w, best_i = g, j
             if best_i is not None:
-                cuts.append(best_i)
-                start = best_i
+                # 方案 B：短非数字尾巴二次过滤
+                # 当找到间隙切点时，检查切出的尾部片段是否为实体名残片——
+                # CJK 词被列边斜切时产生的 ≤5 字非数字尾巴，若远短于前段
+                # （长度比 ≥3:1）且 x 邻接（间隙 ≤0.6×scale），撤销该切点
+                _p1_chars = chars[best_i:]
+                _p1_len = len(_p1_chars)
+                _skip_cut = False
+                if _p1_len <= 5:
+                    _p0_len = best_i - start
+                    _p1_text = "".join(c[3] for c in _p1_chars)
+                    if (_p0_len >= 3 * _p1_len and
+                            not any(_ch in "0123456789" for _ch in _p1_text) and
+                            best_w <= 0.6 * scale and
+                            not (_p1_text and _p1_text[0] in "０１２３４５６７８９")):
+                        _skip_cut = True
+                if not _skip_cut:
+                    cuts.append(best_i)
+                    start = best_i
             # 无间隙：不设切点，该组合并进前段（CJK 斜切保护）
         pieces: List[tuple] = []
         start = 0
@@ -726,11 +743,116 @@ def _cells_from_fragments(page: fitz.Page, box: Rect,
             for ci, text, px0, px1 in pieces:
                 if not text.strip():
                     continue
+                if bleed_map and ci in bleed_map:
+                    ci = bleed_map[ci]
                 if ci not in placed:
                     placed[ci] = []
                     order.append((ci, f["y0"]))
                 placed[ci].append({"text": text, "y0": f["y0"],
                                    "x0": px0, "x1": px1})
+        if not placed:
+            continue
+        # I1 fix v2 (per-fragment): move orphan short-digit fragments to left column.
+        # 适用情形：SLANet 把 "YYYY年5" 合并成一片段，过 col 边界时 "5" 被切到右侧
+        # 列（中心 x 落入 ci 而非 ci-1）。本步把这种 1-2 位游离 digit 归回左列。
+        # 守卫：x邻接（digit.x0 - left_max_x1 ≤ 0.4*scale）、体量（左列 ≥3 字）、
+        # 格式铁证（纯 1-2 位数字，无标点）。
+        _i1_threshold = 0.4 * scale
+        _i1_moves: List[Tuple[int, dict, int]] = []
+        for _i1_ci in sorted(placed.keys()):
+            if _i1_ci == 0:
+                continue
+            if (_i1_ci - 1) not in placed or not placed[_i1_ci - 1]:
+                continue
+            _i1_left_max_x1 = max(_f["x1"] for _f in placed[_i1_ci - 1])
+            for _i1_frag in placed[_i1_ci]:
+                _i1_txt = _i1_frag["text"].strip()
+                if not _i1_txt.isdigit() or not (1 <= len(_i1_txt) <= 2):
+                    continue
+                _i1_gap = _i1_frag["x0"] - _i1_left_max_x1
+                if _i1_gap > _i1_threshold:
+                    continue
+                _i1_left_text = "".join(_f["text"] for _f in placed[_i1_ci - 1]).strip()
+                if len(_i1_left_text) < 3:
+                    continue
+                _i1_moves.append((_i1_ci, _i1_frag, _i1_ci - 1))
+        for _i1_ci, _i1_frag, _i1_target in _i1_moves:
+            placed[_i1_target].append(_i1_frag)
+            order.append((_i1_target, _i1_frag["y0"]))
+            placed[_i1_ci].remove(_i1_frag)
+            for _i1_oi in range(len(order) - 1, -1, -1):
+                if order[_i1_oi] == (_i1_ci, _i1_frag["y0"]):
+                    del order[_i1_oi]
+                    break
+            if not placed[_i1_ci]:
+                del placed[_i1_ci]
+        # R54 I1 date mode: 1-2 digit orphan forming part of a
+        # "YYYY 年M月D日" date pattern. 当左列以 "YYYY 年" 收尾、右列起始
+        # 含 "月" 时，把孤数字归回左列；阈值 0.8*scale（vs 普通 I1 的
+        # 0.4*scale）——格式铁证替代硬抬阈值，专治日期残缺（p55 r23/r34
+        # "2022 年7月11日" 缺 7）。守卫严苛：左列必须真正以 "年" 收尾、
+        # 右列首个非空文本必须含 "月"，避免误触发普通数字列表。
+        if not hasattr(_i1_moves, '_r54_date_re_l'):
+            # R54+1: allow optional 1-2 digit month after 年 (r6 '2016年 5'
+            # mid-date split). Anchors a LEFT fragment ending with the year.
+            _r54_date_re_l = re.compile(r"\d{4}\s*年(?:\s*\d{1,2})?\s*$")
+            # Anchor for the month pattern (in left OR right).
+            _r54_date_month_re = re.compile(r"\d{0,2}\s*月")
+        else:
+            _r54_date_re_l = _i1_moves._r54_date_re_l
+            _r54_date_month_re = _i1_moves._r54_date_month_re
+        _r54_date_threshold = 0.8 * scale
+        _r54_date_moves: List[Tuple[int, dict, int]] = []
+        for _r54_ci in sorted(placed.keys()):
+            if _r54_ci == 0:
+                continue
+            if (_r54_ci - 1) not in placed or not placed[_r54_ci - 1]:
+                continue
+            # R54+1: anchor on a single LEFT fragment ending with YYYY 年
+            # (not the joined text — multi-line cells concatenate 'YYYY 年
+            # ...月 11 日' which fails the trailing-年 test).
+            _r54_year_frag = None
+            for _r54_lf in placed[_r54_ci - 1]:
+                if _r54_date_re_l.search(_r54_lf["text"].rstrip()):
+                    _r54_year_frag = _r54_lf
+                    break
+            if _r54_year_frag is None:
+                continue
+            # R54+1: month pattern may be in LEFT (line-2 fragment) OR RIGHT
+            # (r23/r34 case). Look in both.
+            _r54_has_month_left = any(
+                _r54_date_month_re.search(_f["text"])
+                for _f in placed[_r54_ci - 1])
+            _r54_has_month_right = any(
+                _r54_date_month_re.search(_f["text"])
+                for _f in placed[_r54_ci])
+            if not (_r54_has_month_left or _r54_has_month_right):
+                continue
+            # Find orphan 1-2 digit fragment in RIGHT near the year anchor.
+            _r54_anchor_x1 = _r54_year_frag["x1"]
+            for _r54_frag in placed[_r54_ci]:
+                _r54_txt = _r54_frag["text"].strip()
+                if not _r54_txt.isdigit() or not (1 <= len(_r54_txt) <= 2):
+                    continue
+                _r54_gap = _r54_frag["x0"] - _r54_anchor_x1
+                if _r54_gap > _r54_date_threshold:
+                    continue
+                # R54+1: the orphan must come from the same y-band as the
+                # year anchor (line wrap would put 月 on line 2, so orphan
+                # is on line 1). Reject orphans far below year y0.
+                if _r54_frag["y0"] > _r54_year_frag["y0"] + 0.5 * scale:
+                    continue
+                _r54_date_moves.append((_r54_ci, _r54_frag, _r54_ci - 1))
+        for _r54_ci, _r54_frag, _r54_target in _r54_date_moves:
+            placed[_r54_target].append(_r54_frag)
+            order.append((_r54_target, _r54_frag["y0"]))
+            placed[_r54_ci].remove(_r54_frag)
+            for _r54_oi in range(len(order) - 1, -1, -1):
+                if order[_r54_oi] == (_r54_ci, _r54_frag["y0"]):
+                    del order[_r54_oi]
+                    break
+            if not placed[_r54_ci]:
+                del placed[_r54_ci]
         if not placed:
             continue
         # header mode: the whole row is 1-2 wide fragments
@@ -938,6 +1060,280 @@ def _edge_support(rows: list, edges: List[float]) -> int:
     return n
 
 
+# ── Multi-column wrapped band merge ───────────────────────────────────────
+
+
+def _merge_multi_col_wraps(rows: list, edges: List[float],
+                           scale: float = 9.0) -> list:
+    """
+    多列折行合并（列签名对齐）：泛化 _merge_wrapped_label_bands。
+
+    两连续文本带 A、B 若满足：
+      C1（列签名子集）：B 的 fragment 起始 x 都是 A 起始 x 的子集
+         （容差 WRAP_LEFT_TOL × 字号）；
+      C2（非单列退化）：A 在 ≥2 列内有 fragment；
+      C3（逐对无结构性否决）：每对同列 fragment 都通过 _wrap_veto_pair，
+    则判定 B 是 A 的续行，合并 A 与 B。
+
+    连锁吸收支持三行及以上折行。
+    """
+    import bisect
+    if len(edges) < 3 or len(rows) < 2:
+        return rows
+
+    def _col_of(x: float) -> int:
+        return max(0, min(len(edges) - 2, bisect.bisect_right(edges, x) - 1))
+
+    def _signatures_align(spans_a, spans_b) -> bool:
+        # C1: B's fragment x-starts subset of A's (nearest-match)
+        a_starts = sorted({s[0] for s in spans_a if s[2].strip()})
+        b_starts = sorted({s[0] for s in spans_b if s[2].strip()})
+        if not b_starts:
+            return True
+        if not a_starts:
+            return False
+        for bs in b_starts:
+            nearest = min(a_starts, key=lambda a: abs(a - bs))
+            if abs(bs - nearest) > WRAP_LEFT_TOL * scale:
+                return False
+        # C2: A spans >= 2 columns
+        a_cols = {_col_of((s[0] + s[1]) / 2) for s in spans_a if s[2].strip()}
+        return len(a_cols) >= 2
+
+    out: list = []
+    i = 0
+    while i < len(rows):
+        cur = rows[i]
+        j = i + 1
+        while j < len(rows):
+            nxt = rows[j]
+            if not _signatures_align(cur[2], nxt[2]):
+                break
+            cur_h = cur[1] - cur[0]
+            nxt_h = nxt[1] - nxt[0]
+            # C4: row height ratio — 续行显著短于主行，等高行不是续行
+            if cur_h > 0 and nxt_h / cur_h > 0.7:
+                break
+                break
+            # C3: per-column-pair structural veto
+            veto = False
+            for bx0, bx1, bt in nxt[2]:
+                if not bt.strip():
+                    continue
+                bc = _col_of((bx0 + bx1) / 2)
+                a_match = [s for s in cur[2]
+                           if _col_of((s[0] + s[1]) / 2) == bc
+                           and s[2].strip()]
+                if a_match and _wrap_veto_pair(a_match[0][2], bt):
+                    veto = True
+                    break
+            if veto:
+                break
+            cur = [min(cur[0], nxt[0]), max(cur[1], nxt[1]),
+                   sorted(cur[2] + nxt[2], key=lambda s: (s[0], s[1]))]
+            j += 1
+        out.append(cur)
+        i = j
+    return out
+
+
+def _wrap_veto_pair(t_a: str, t_b: str) -> bool:
+    """
+    同列 fragment 对是否构成结构性独立行——逐对判定。
+
+    True = 否决合并（首行 fragment 是完整结构标签）。
+    """
+    t_a = (t_a or '').strip()
+    t_b = (t_b or '').strip()
+    if not t_a or not t_b:
+        return False
+    if _WRAP_COMPLETE_END.search(t_a):
+        return True
+    if any(rx.match(t_a) or rx.match(t_b) for rx in _WRAP_ENUM_PREFIX):
+        return True
+    return False
+
+
+# ── Column envelope consistency ───────────────────────────────────────────
+
+
+_NUM_BLEED_LEFT = re.compile(r'\d$')
+_NUM_BLEED_RIGHT = re.compile(r'^[,，]\d')
+_CJK_PAIR = re.compile(r'^[\u4e00-\u9fff]{2,}$')
+
+
+def _col_env_verify(rows: list, edges: List[float],
+                    scale: float = 9.0) -> Tuple[List[float], dict]:
+    """
+    列包络自洽性检验（策略 I · 数值碎片逻辑合并）。
+
+    对每个内部列界，计算两侧列的文本 span x-包络。若包络显著重叠
+    （≥ 0.25 × 字号），检测该边界是否切割了本属同一列的连续文本：
+
+      数值劈裂 —— 左列以数字收尾 + 右列以逗号+数字起始
+      CJK 切分 —— 双方均为 ≥2 字纯中文，无标点阻隔
+
+    返回 (edges, bleed_map)：bleed_map[col_k] = col_k-1 表示
+    col_k 的内容应向左归入 col_k-1。
+    """
+    import bisect
+    n_cols = len(edges) - 1
+    if n_cols < 2:
+        return edges, {}
+    colw = (edges[-1] - edges[0]) / max(1, n_cols)
+
+    # Column x-envelopes from span centres
+    envs = [(float('inf'), float('-inf')) for _ in range(n_cols)]
+    for _y0, _y1, spans in rows:
+        for x0, x1, _t in spans:
+            if x1 - x0 >= SPAN_CELL_WIDTH * colw:
+                continue
+            cx = (x0 + x1) / 2.0
+            ci = max(0, min(n_cols - 1,
+                           bisect.bisect_right(edges, cx) - 1))
+            lo, hi = envs[ci]
+            envs[ci] = (min(lo, x0), max(hi, x1))
+
+    bleed_map: dict = {}
+    for k in range(1, n_cols - 1):
+        left_hi = envs[k - 1][1]
+        right_lo = envs[k][0]
+        if left_hi == float('-inf') or right_lo == float('inf'):
+            continue
+        ov = left_hi - right_lo
+        if ov < 0.25 * scale:
+            continue
+
+        # Gather spans near boundary k
+        left_near = []
+        right_near = []
+        for _y0, _y1, spans in rows:
+            for x0, x1, t in spans:
+                if not t.strip() or x1 - x0 >= SPAN_CELL_WIDTH * colw:
+                    continue
+                cx = (x0 + x1) / 2.0
+                ci = bisect.bisect_right(edges, cx) - 1
+                if ci == k - 1 and abs(x1 - edges[k]) < 1.5 * scale:
+                    left_near.append((x0, x1, t))
+                elif ci == k and abs(x0 - edges[k]) < 1.5 * scale:
+                    right_near.append((x0, x1, t))
+
+        found = False
+        for _lx0, _lx1, lt in left_near:
+            if found:
+                break
+            for _rx0, _rx1, rt in right_near:
+                if found:
+                    break
+                # Strong: digit-end + comma-digit
+                if _NUM_BLEED_LEFT.search(lt) and _NUM_BLEED_RIGHT.search(rt):
+                    found = True
+                    break
+                # Weaker: digit-end + digit-start, both contain ≥2 digits
+                if _NUM_BLEED_LEFT.search(lt) and re.match(r'^\d', rt):
+                    if re.search(r'\d{2,}', lt) and re.search(r'\d{2,}', rt):
+                        found = True
+                        break
+                # CJK split: ≥2 hanzi on both sides, no punct at boundary
+                if _CJK_PAIR.search(lt) and _CJK_PAIR.search(rt):
+                    if not re.search(r'[，。、；：？！\\)）\]]',
+                                     (lt[-1:] + rt[:1])):
+                        found = True
+                        break
+        if found:
+            bleed_map[k] = k - 1
+
+    return edges, bleed_map
+
+
+# ── NUM-DUP: same-column numeric duplicate absorption ────────────────────
+
+
+# ── NUM-DUP: same-column numeric duplicate absorption ────────────────────
+
+
+_NUM_DUP_RE = re.compile(r'\d[\d,，.]*\d|\d{4,}')
+_NUM_DUP_WS = re.compile(r'[\s\n]+')
+
+
+def _dedup_numeric_text(text):
+    """
+    在文本中去除相邻的数值重复模式（跨空白也生效）。
+
+    消歧规则（打回第 2 轮·CTO）：
+    - 拼接型（全等、无空白，如 "143,003,924143,003,924"）→ 消重（NUM-DUP 缺陷）
+    - 截断前缀型（second 严格短于 num 且 second 为 num 的前缀，如
+      "143,003,924 143,003,"）→ 消重（SLANet 截断残片）
+    - 完整等值型（second 与 num 等长等值，如 "2.15 2.15"、"82.62 82.62"）
+      → 一律保留（合法双列同值，不属 NUM-DUP）
+
+    返回去重后的文本。用于 cell text 修复 NUM-DUP 缺陷。
+    """
+    changed = True
+    while changed:
+        changed = False
+        for m in _NUM_DUP_RE.finditer(text):
+            num = m.group()
+            end = m.end()
+            rest = text[end:]
+            # 拼接型：rest 直接以 num 开头，无空白分隔 → NUM-DUP 缺陷
+            if rest.startswith(num):
+                text = text[:end] + rest[len(num):]
+                changed = True
+                break
+            wsm = _NUM_DUP_WS.match(rest)
+            if wsm:
+                after_ws = rest[wsm.end():]
+                m2 = _NUM_DUP_RE.match(after_ws)
+                if m2:
+                    second = m2.group()
+                    # 截断前缀守卫：second 严格 shorter 且为 num 前缀才消重
+                    if len(second) < len(num) and num.startswith(second):
+                        text = text[:end] + after_ws[len(second):]
+                        changed = True
+                        break
+                    # 完整等值型：len(second) == len(num) 且 second == num → 保留
+                    # （合法双列同值，不属 NUM-DUP 缺陷）
+    return text
+
+
+def _dedup_date_newlines(cells):
+    """R54+1: strip intra-cell newlines that break a date pattern.
+
+    A cell containing "YYYY 年 ... 月 ... 日/至今" may have internal
+    newlines from line wrap (e.g., '2016年 5\n月 5 日' → '2016年 5月 5 日',
+    '2022 年\n7\n月 11 日' → '2022 年7月 11 日'). Only touches cells with
+    the year anchor and limits match span to 30 chars per segment to avoid
+    bridging unrelated multi-line content (承诺事项正文等).
+    """
+    _r54_date_anchor = re.compile(r"\d{4}\s*年")
+    _r54_date_pat = re.compile(
+        r"(\d{4}\s*年[\s\S]{0,30}?\d{0,2}\s*月[\s\S]{0,30}?(?:日|至今))")
+    for _r54_c in cells:
+        if not _r54_c.text or "\n" not in _r54_c.text:
+            continue
+        if not _r54_date_anchor.search(_r54_c.text):
+            continue
+        _r54_new = _r54_date_pat.sub(
+            lambda m: m.group(0).replace("\n", ""), _r54_c.text)
+        if _r54_new != _r54_c.text:
+            _r54_c.text = _r54_new
+    return cells
+
+
+def _dedup_cell_text(cells):
+    """
+    Cell-level numeric duplicate absorption（轨道C p84：同格吸收截断片段）。
+
+    对 cells 中每个 CellOutput.text 调用 _dedup_numeric_text。
+    """
+    for c in cells:
+        c.text = _dedup_numeric_text(c.text)
+    return cells
+
+# ── Rebuild grid ─────────────────────────────────────────────────────────
+
+
 def rebuild_grid(page: fitz.Page, box: Rect,
                  col_edges: Optional[List[float]] = None,
                  src_cols: Optional[int] = None,
@@ -1064,6 +1460,7 @@ def rebuild_grid(page: fitz.Page, box: Rect,
             keep_rows = [row_edges.index(a) for a, _b in intervals]
     if row_edges is None:
         rows = _merge_header_bands(rows, edges)
+        rows = _merge_multi_col_wraps(rows, edges, scale)
         # y boundaries: bbox top, then band midpoints, then bbox bottom
         yb = [box[1]]
         for a, b in zip(rows, rows[1:]):
@@ -1082,8 +1479,14 @@ def rebuild_grid(page: fitz.Page, box: Rect,
             intervals = list(zip(yb, yb[1:]))
             n_rows = len(rows)
             row_edges = yb
+    edges, bleed_map = _col_env_verify(rows, edges, scale)
+    # 列签名对齐合并：无线分支已在上面调用，此处针对 ruled 密排表
+    # （无线分支的调用在 if row_edges is None 块内，不会重复）
+    if row_edges is not None:
+        rows = _merge_multi_col_wraps(rows, edges, scale)
     cells, edges = _cells_from_fragments(page, box, row_edges, edges,
-                                        keep_rows=keep_rows)
+                                        keep_rows=keep_rows,
+)
     n_cols = len(edges) - 1   # 间隙补边可能新增列，以最终列边为准
     if keep_rows is not None:
         # re-index rows from the full rule set down to the kept intervals
@@ -1178,4 +1581,6 @@ def complete_table(page: fitz.Page,
 
     _log.info(f"completion: rebuilt {num_rows}x{num_cols} SLANet grid as "
               f"{new_rows}x{new_cols} (text recall {before:.3f}→{after:.3f})")
+    new_cells = _dedup_cell_text(new_cells)
+    new_cells = _dedup_date_newlines(new_cells)
     return new_cells, new_rows, new_cols, True

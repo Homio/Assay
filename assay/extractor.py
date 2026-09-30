@@ -687,6 +687,122 @@ def _table_char_index(page: fitz.Page,
     return chars
 
 
+_NUM_FULL_RE = re.compile(r"^-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
+_NUM_CHARS = frozenset("0123456789.,-")
+
+
+def _glue_numeric_seeps(assigned: List[List], cell_meta: list,
+                        med_cs: float) -> None:
+    """密排数值列的拆粘归位。
+
+    SLANet 对密排多列表给出的相邻格 bbox 互相重叠（右对齐数值列普遍
+    重叠 6-8pt），跨格排版数字串的边缘字形中心落入重叠带时，含格判
+    定（最小面积优先）会把它抢进邻格——"2,707,138.34" 拆成
+    "2,707,138.3"（本格）+"4"（右格），"1,051,128,788.30" 的首字
+    "1" 落进左格。同一排版文本串的字形间隙 ≤0.2×字号，而跨格的
+    独立内容至少隔一个空格宽——按 x 邻接性把串格碎片归回原格。
+    只移动纯数值碎片，且归位后的完整串必须满足千分位/普通数值格
+    式；文本格、混合内容格不受影响。
+    """
+    if med_cs <= 0:
+        return
+    glue_gap = 0.2 * med_cs  # 同串字形间隙上限：串内数字对间隙远小于
+                             # 此，单空格（≈0.25×字号）即超过——靠它把
+                             # 空格分隔的相邻数值切成两串
+    sep_gap = 0.5 * med_cs   # 碎片与格内其余内容的最小隔离：须大于单
+                             # 空格宽，小于真实列间隔（≥3 空格）
+
+    by_rc: Dict[Tuple[int, int], int] = {}
+    for ci, (sr, _er, sc, _ec, _r) in enumerate(cell_meta):
+        by_rc.setdefault((sr, sc), ci)
+
+    def _lines(chars: list) -> list:
+        lines: list = []
+        for ch in sorted(chars, key=lambda c: (c[5], c[0])):
+            if lines and abs(lines[-1][0][5] - ch[5]) <= 3.0:
+                lines[-1].append(ch)
+            else:
+                lines.append([ch])
+        for ln in lines:
+            ln.sort(key=lambda c: c[0])
+        return lines
+
+    def _is_frag(run: list) -> bool:
+        # 串格碎片体量约束：SLANet 相邻格 bbox 重叠 6-9pt，落入重叠带
+        # 被抢走的只能是 1-2 个纯数字字形（含分隔符/更长的碎片属"列
+        # 界整体偏移"的另一类缺陷，宿主方向需列对齐证据才能判定，本
+        # 函数刻意不碰）
+        return 1 <= len(run) <= 2 and all(c[4].isdigit() for c in run)
+
+    def _num_run(line: list, from_right: bool) -> list:
+        # 行首/行尾的边缘数值串：数字字符集且 x 邻接（间隙 ≤glue_gap，
+        # 同排版串特征）。空格字形不入 assigned，不能靠字符集截断——
+        # "0 2,707,138.3" 会被整行当一串，必须按间隙切成 ["0",
+        # "2,707,138.3"]
+        run: list = []
+        seq = list(reversed(line)) if from_right else line
+        for ch in seq:
+            if ch[4] not in _NUM_CHARS:
+                break
+            if run:
+                gap = (run[-1][0] - ch[2]) if from_right \
+                    else (ch[0] - run[-1][2])
+                if gap > glue_gap:
+                    break
+            run.append(ch)
+        if from_right:
+            run.reverse()
+        return run
+
+    def _glue_pair(lchars: list, rchars: list) -> bool:
+        for rline in _lines(rchars):
+            r_run = _num_run(rline, from_right=False)
+            if not r_run:
+                continue
+            nxt = rline[len(r_run):]
+            if nxt and nxt[0][0] - r_run[-1][2] < sep_gap:
+                continue  # 与右格自身内容粘连，非串格碎片
+            for lline in _lines(lchars):
+                if abs(lline[0][5] - rline[0][5]) > 3.0:
+                    continue
+                l_run = _num_run(lline, from_right=True)
+                if not l_run:
+                    continue
+                prv = lline[: len(lline) - len(l_run)]
+                if prv and l_run[0][0] - prv[-1][2] < sep_gap:
+                    continue
+                if not (-0.5 <= r_run[0][0] - l_run[-1][2] <= glue_gap):
+                    continue
+                l_txt = "".join(c[4] for c in l_run)
+                r_txt = "".join(c[4] for c in r_run)
+                if not _NUM_FULL_RE.match(l_txt + r_txt):
+                    continue
+                if not _NUM_FULL_RE.match(r_txt):
+                    # HEAD：右格丢了首段（",051,128,788.30" 的前导逗号
+                    # 不可能是独立内容）→ 左格尾串是它的头，归右格
+                    if not _is_frag(l_run):
+                        continue
+                    for ch in l_run:
+                        lchars.remove(ch)
+                    rchars.extend(l_run)
+                else:
+                    # TAIL：右格左端碎片是左格数字的尾段，归左格
+                    if not _is_frag(r_run):
+                        continue
+                    for ch in r_run:
+                        rchars.remove(ch)
+                    lchars.extend(r_run)
+                return True
+        return False
+
+    for sr in sorted({r for r, _c in by_rc}):
+        cols = sorted(c for r, c in by_rc if r == sr)
+        for a, b in zip(cols, cols[1:]):
+            li, ri = by_rc[(sr, a)], by_rc[(sr, b)]
+            if assigned[li] and assigned[ri]:
+                _glue_pair(assigned[li], assigned[ri])
+
+
 def _chars_to_text(chars: List[Tuple[float, float, float, float, str, float]]
                    ) -> str:
     """Assigned glyphs → cell text: 同行按 x 排接，行间（y 跨 >3pt）
@@ -820,6 +936,28 @@ def build_table_from_slanet(
         lo, hi = col_env.get(sc, (r[0], r[2]))
         col_env[sc] = (min(lo, r[0]), max(hi, r[2]))
 
+    # 行包络：同行所有格的 y 并集——列包络的纵轴对称。SLANet 同行格的
+    # 高度常不一致（折行表头只框住首条视觉线、页缘碎片表行高切进文字带），
+    # 纵向中心略超单格下沿的字形（折行表头的续行）按行包络归属而非单格
+    # bbox，续行字形回到本行格。应用位置与 col_env 一致（重叠/最近格两级），
+    # 不含 containment——行带内字形本就被 raw 格包含，无需放宽。
+    row_env: dict = {}
+    for (sr, _er, _sc, _ec, r) in cell_meta:
+        lo, hi = row_env.get(sr, (r[1], r[3]))
+        row_env[sr] = (min(lo, r[1]), max(hi, r[3]))
+
+    # 有界行包络：单侧扩界不超过 1×区域中位字号。行高不一致在一个行高
+    # 以内是"同一逻辑行、格高量化噪声"（折行表头续行、碎片表行高切线）；
+    # 超过一个行高说明邻格本就属于更高的带（跨行合并的数据带），扩界会把
+    # 带间边界的孤字错吸进邻行——此时退回 raw 格，保持基线行为。
+    _med_y = _median_char_size(all_chars) if all_chars else 9.0
+
+    def _row_bounded_y(ci: int, r) -> Tuple[float, float]:
+        renv = row_env.get(cell_meta[ci][0], (r[1], r[3]))
+        ey0 = min(r[1], renv[0]) if r[1] - renv[0] <= _med_y else r[1]
+        ey1 = max(r[3], renv[1]) if renv[1] - r[3] <= _med_y else r[3]
+        return ey0, ey1
+
     assigned: List[List] = [[] for _ in range(n_cells)]
     if all_chars and cell_rects:
         areas = [(r[2] - r[0]) * (r[3] - r[1])
@@ -837,12 +975,13 @@ def build_table_from_slanet(
                 continue
             best, best_score = -1, 0.30
             for ci, r in enumerate(cell_rects):
-                if r[3] + 2 < cy or r[1] - 2 > cy:
+                ey0, ey1 = _row_bounded_y(ci, r)
+                if ey1 + 2 < cy or ey0 - 2 > cy:
                     continue
                 env = col_env.get(cell_meta[ci][2], (r[0], r[2]))
                 ex0, ex1 = min(r[0], env[0]), max(r[2], env[1])
-                ix0, iy0 = max(ch[0], ex0), max(ch[1], r[1])
-                ix1, iy1 = min(ch[2], ex1), min(ch[3], r[3])
+                ix0, iy0 = max(ch[0], ex0), max(ch[1], ey0)
+                ix1, iy1 = min(ch[2], ex1), min(ch[3], ey1)
                 if ix1 <= ix0 or iy1 <= iy0:
                     continue
                 score = (ix1 - ix0) * (iy1 - iy0) / carea
@@ -861,17 +1000,24 @@ def build_table_from_slanet(
             for ci, r in enumerate(cell_rects):
                 if r[2] <= r[0] or r[3] <= r[1]:
                     continue
-                if not (r[1] - 0.25 * cs <= cy <= r[3] + 0.25 * cs):
+                ey0, ey1 = _row_bounded_y(ci, r)
+                if not (ey0 - 0.25 * cs <= cy <= ey1 + 0.25 * cs):
                     continue
                 env = col_env.get(cell_meta[ci][2], (r[0], r[2]))
                 ex0, ex1 = min(r[0], env[0]), max(r[2], env[1])
                 dx = max(ex0 - cx, 0.0, cx - ex1)
-                dy = max(r[1] - cy, 0.0, cy - r[3])
+                dy = max(ey0 - cy, 0.0, cy - ey1)
                 d = (dx * dx + dy * dy) ** 0.5
                 if d < best_dist:
                     best, best_dist = ci, d
             if best >= 0:
                 assigned[best].append(ch)
+
+    # 数值拆粘归位：SLANet 密排数值列相邻格 bbox 重叠导致的跨格串字
+    # （"2,707,138.3|4"、"1|,051,128,788.30"），在转文本前归位
+    if all_chars and cell_rects:
+        _glue_numeric_seeps(assigned, cell_meta,
+                            _median_char_size(all_chars))
 
     for i in range(n_cells):
         start_row, end_row, start_col, end_col, pdf_bbox = cell_meta[i]
