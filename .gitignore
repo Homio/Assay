@@ -41,3 +41,8 @@ venv/
 
 # Backup files
 *.bak*
+
+# Eval caches & debug outputs
+eval/pred_cache/
+tmp_gt_check/
+eval/checks/*.png
