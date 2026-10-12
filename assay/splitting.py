@@ -29,7 +29,7 @@ Safety invariants:
 from __future__ import annotations
 
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 Rect = Tuple[float, float, float, float]
 
@@ -943,3 +943,161 @@ def split_by_grid_bands(page, box: Rect, H: list, V: list) -> List[Rect]:
         segments.append((box[0], min(y0 for y0, _ in my) - GB_PAD,
                          box[2], max(y1 for _, y1 in my) + GB_PAD))
     return segments if len(segments) > 1 else [box]
+
+
+# ── Per-page markdown splitting & verification (C8) ─────────────────────────
+#
+# Root cause of the systematic -1 offset: export_to_markdown numbers its
+# "<!-- Page N -->" markers with the fitz 0-based page index, while every
+# downstream consumer (per-page md files, audit tooling, dashboards, RAG
+# citations) numbers physical pages from 1.  Splitting a full-book md on the
+# raw markers therefore yields page_0NNN.md holding physical page NNN+1's
+# content (verified full-book on 平安银行 296p / 滨海能源 169p:
+# marker N segment matches PDF physical page N+1 with ~0.75-1.0 signature
+# coverage vs ~0.0 on both neighbours; evidence in
+# analysis/fix_c1c8/trackE/).  The segment CONTENT is correctly assigned to
+# its marker — page headers/footers are NOT bled into the next page — so the
+# entire offset is the marker numbering base.
+#
+# These helpers are the single canonical per-page entry point:
+#   split_markdown_pages  — split + re-base segments to 1-based physical
+#                           page numbers regardless of on-disk marker base;
+#   tag_pdf_page          — stamp an explicit "<!-- PDF page: N -->" header
+#                           (fix_recommendations C8 item 3);
+#   write_per_page_md     — emit page_0NNN.md files keyed by physical page;
+#   verify_markdown_pages — re-match every segment against the source PDF
+#                           and flag any page whose content sits on a
+#                           neighbouring physical page (C8 item 2), so an
+#                           offset can never ship silently again.
+
+_MD_PAGE_RE = re.compile(r'<!-- Page (\d+) -->')
+_PDF_PAGE_META_RE = re.compile(r'<!-- PDF page:\s*(\d+) -->')
+# Signature alphabet for ownership matching: CJK ideographs + digits only.
+# Markdown syntax (###, |, ---), punctuation and whitespace differ between
+# md and the PDF text layer; neither carries page identity.
+_SIG_STRIP_RE = re.compile(r'[^一-鿿0-9]')
+
+# Signature window length (significant chars).  A text-identity parameter,
+# not a geometric threshold: long enough that a window is near-unique within
+# a page, short enough to survive reading-order reflow inside table rows.
+# Calibrated full-book on 平安银行/滨海能源: w=12 keeps every page's
+# expected-page coverage strictly above both neighbours (w=20/40 start
+# false-flagging digit-fragmented table pages).
+VERIFY_WINDOW = 12
+
+
+def _sig(text: str) -> str:
+    return _SIG_STRIP_RE.sub('', text)
+
+
+def split_markdown_pages(md_text: str,
+                         page_count: Optional[int] = None) -> Dict[int, str]:
+    """Split full-book markdown into ``{physical_page: segment}``.
+
+    Keys are 1-based physical page numbers regardless of the on-disk marker
+    base.  Base detection: a ``Page 0`` marker proves legacy 0-based
+    numbering; without it, ``page_count`` (physical page count of the source
+    PDF) disambiguates — max marker == page_count - 1 means 0-based, max
+    marker == page_count means 1-based.  With neither signal the markers are
+    trusted as already 1-based (the forward format once the generator is
+    fixed).
+    """
+    parts = _MD_PAGE_RE.split(md_text)
+    markers = [int(parts[i]) for i in range(1, len(parts), 2)]
+    if not markers:
+        return {}
+    if min(markers) == 0:
+        base = 1                       # legacy 0-based markers
+    elif page_count is not None and max(markers) == page_count - 1:
+        base = 1                       # page 0 empty/absent, still 0-based
+    else:
+        base = 0                       # already 1-based
+    return {int(parts[i]) + base: parts[i + 1]
+            for i in range(1, len(parts), 2)}
+
+
+def tag_pdf_page(segment: str, physical_page: int) -> str:
+    """Prepend the explicit physical-page metadata header (idempotent)."""
+    if _PDF_PAGE_META_RE.search(segment):
+        return segment
+    return f'<!-- PDF page: {physical_page} -->\n' + segment.lstrip('\n')
+
+
+def write_per_page_md(md_text: str, out_dir: str, *,
+                      page_count: Optional[int] = None,
+                      with_meta: bool = True) -> List[int]:
+    """Write one ``page_NNNN.md`` per physical page; returns pages written."""
+    import os
+    pages = split_markdown_pages(md_text, page_count)
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for phys in sorted(pages):
+        seg = pages[phys]
+        if with_meta:
+            seg = tag_pdf_page(seg, phys)
+        with open(os.path.join(out_dir, f'page_{phys:04d}.md'),
+                  'w', encoding='utf-8') as f:
+            f.write(seg)
+        written.append(phys)
+    return written
+
+
+def verify_markdown_pages(md_text: str, pdf, *,
+                          window: int = VERIFY_WINDOW) -> dict:
+    """Verify every segment sits on its physical page (C8 split校验).
+
+    ``pdf`` is a filesystem path or an open fitz.Document.  For each segment
+    the signature (CJK+digit) windows are matched against the expected
+    physical page and its two neighbours.  Verdicts per page:
+      ok              — expected page strictly beats both neighbours;
+      OFFSET_SUSPECT  — a neighbour beats the expected page (the C8 defect);
+      ambiguous       — expected ties a neighbour (near-empty/cover pages
+                        whose little text recurs across pages);
+      low_signal      — no window matched anywhere (heavy reading-order
+                        reflow, e.g. TOC row/page-number re-pairing, or
+                        image-only pages) — unverifiable by signature.
+    Returns ``{'pages': {phys: {...}}, 'summary': {...}}``.
+    """
+    import fitz
+    doc = fitz.open(pdf) if isinstance(pdf, str) else pdf
+    pages = split_markdown_pages(md_text, len(doc))
+    ptxt = [_sig(doc[p].get_text()) for p in range(len(doc))]
+
+    def cover(seg_sig: str, p: int) -> float:
+        wins = [seg_sig[i:i + window]
+                for i in range(0, max(1, len(seg_sig) - window + 1), window)
+                if len(seg_sig[i:i + window]) == window]
+        if not wins:
+            return -1.0                # no signature material at all
+        return sum(1 for w in wins if w in ptxt[p]) / len(wins)
+
+    report: Dict[int, dict] = {}
+    for phys in sorted(pages):
+        s = _sig(pages[phys])
+        idx = phys - 1
+        c_exp = cover(s, idx) if 0 <= idx < len(doc) else -1.0
+        c_prev = cover(s, idx - 1) if idx - 1 >= 0 else -1.0
+        c_next = cover(s, idx + 1) if idx + 1 < len(doc) else -1.0
+        c_near = max(c_prev, c_next)
+        if c_exp < 0:
+            verdict = 'empty'
+        elif c_exp == 0 and c_near <= 0:
+            verdict = 'low_signal'
+        elif c_near > c_exp:
+            verdict = 'OFFSET_SUSPECT'
+        elif c_near == c_exp:
+            verdict = 'ambiguous'
+        else:
+            verdict = 'ok'
+        report[phys] = {'verdict': verdict,
+                        'coverage': round(c_exp, 3),
+                        'prev': round(c_prev, 3),
+                        'next': round(c_next, 3)}
+    summary: Dict[str, int] = {}
+    for r in report.values():
+        summary[r['verdict']] = summary.get(r['verdict'], 0) + 1
+    if isinstance(pdf, str):
+        doc.close()
+    return {'pages': report, 'summary': summary,
+            'offset_suspects': [p for p, r in report.items()
+                                if r['verdict'] == 'OFFSET_SUSPECT']}

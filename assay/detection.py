@@ -434,6 +434,66 @@ def _hdr_sig(text: str) -> str:
     return _HDR_STRIP_RE.sub("", text)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Statement / notes caption calibration (C2 报表页眉, C6 持续表接口)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# 报表页眉 = 财报附注段每页顶部重复印刷的报表标题块
+# （"XX公司 合并资产负债表(续) 2025年12月31日 人民币元"）。它有两种失稳形态：
+#   * 跨页丢失——页眉共识过滤或"视觉行伙伴"连带删除把它从文本流剥掉
+#     （平安 p122-p296：报表名行紧贴公司名行，被 ±2pt 交叠规则一并删除）；
+#   * 吸入表格首格——未被识别时它留在表格框内，落成首行首格
+#     （紫光 p99 "| 合并利润表 | 附注五 | …"）。
+# 本模块在全书扫描阶段（calibrate_page_headers 的同一趟遍历）识别两类页眉行：
+#   Class A 报表名行：签名整行匹配 报表名模式（允许 "1、" 编号前缀与 "(续)"），
+#           记录在顶部带（×页高）内的出现页，以及全书每页最后一个报表名行
+#           （会话锚点——续页缺页眉时由输出层继承上一报表名 + (续)）；
+#   Class B 附注页眉行：顶部带内含"附注"且签名被运行页眉共识剥除的行
+#           （"财务报表附注(续)"），同样属于被剥掉的内容型页眉。
+# 识别结果只读地暴露给输出层（statement_caption_info），以块 metadata
+# 形式挂回文本块/表格 prov——新增键，不改既有键语义。
+
+CAPTION_TOP_FRAC = 0.25     # 报表名行的顶部识别带（×页高）：紫光表内标题行
+                            # 在 ~0.15H，平安报表名行在 ~0.08H，均落入
+
+_STMT_NAME_RE = _re.compile(
+    r"^[、.．·]?[一-鿿]{0,4}"
+    r"(?:资产负债表|利润表|现金流量表|股东权益变动表|所有者权益变动表)"
+    r"(?:[(（]续[)）])?$")
+
+_stmt_cap_cache: dict = {}
+
+
+def _stmt_canon(sig: str) -> str:
+    """Canonical statement name: strip leading enumerator and (续) marker."""
+    s = _re.sub(r"^[、.．·]+", "", sig)
+    s = _re.sub(r"[(（]续[)）]$", "", s)
+    return s
+
+
+def _file_stem(s: str) -> str:
+    """Filename minus directory and a trailing .pdf (NOT Path.stem — book
+    stems contain dots, e.g. '000001.SZ', which Path.stem would eat)."""
+    n = Path(s).name
+    return n[:-4] if n.lower().endswith(".pdf") else n
+
+
+def statement_caption_info(stem: str) -> dict:
+    """
+    Caption metadata for the output layer (C2/C6), keyed by file stem.
+
+    Returns {"pages": {page_no: caption entry}, "sessions": {page_no: entry}}
+    or {} when no calibration ran (standalone use — fail-open, no behaviour
+    change).  Populated as a side effect of calibrate_page_headers, which the
+    extractor always calls in Phase 1, in-process, before export.
+    """
+    want = _file_stem(stem)
+    for (name, _n), v in _stmt_cap_cache.items():
+        if _file_stem(name) == want:
+            return v
+    return {}
+
+
 def calibrate_page_headers(doc) -> set:
     """
     Learn this document's running-header line signatures.
@@ -448,28 +508,97 @@ def calibrate_page_headers(doc) -> set:
     one qualifying key per placement.  Returns a set of signature strings;
     empty set = headerless document, trim disabled (fail-open to the
     current behaviour — a missed trim never breaks anything).
+
+    Side effect (C2/C6): the same single pass also collects statement-name
+    caption lines and stripped 附注 header lines into _stmt_cap_cache for the
+    output layer — see statement_caption_info.
     """
     key = (doc.name, len(doc))
     if key in _hdr_sig_cache:
         return _hdr_sig_cache[key]
 
     counts: dict = {}
+    cap_pages: dict = {}      # page_no -> top-band caption entry (Class A/B)
+    cap_sessions: dict = {}   # page_no -> last statement-name entry on page
+    notes_cand: dict = {}     # page_no -> 附注 header candidate (pre-filter)
+    plines: dict = {}         # page_no -> raw lines (caption pages only)
     for page in doc:
         seen = set()
+        top_stmt = None
+        last_stmt = None
+        page_lines = []
+        ph = page.rect.height
         for block in page.get_text("dict")["blocks"]:
             for line in block.get("lines", []):
-                ly0 = line["bbox"][1]
+                lx0, ly0, lx1, ly1 = line["bbox"]
+                txt = "".join(s["text"] for s in line["spans"]).strip()
+                sig = _hdr_sig(txt)
+                if txt:
+                    page_lines.append((lx0, ly0, lx1, ly1, txt, sig))
+                if _STMT_NAME_RE.match(sig):
+                    canon = _stmt_canon(sig)
+                    entry = {
+                        "kind": "statement",
+                        "name": canon,
+                        "text": txt,
+                        "bbox": (lx0, ly0, lx1, ly1),
+                        "printed_continued": "续" in sig and sig != canon,
+                    }
+                    if ly0 < CAPTION_TOP_FRAC * ph and top_stmt is None:
+                        top_stmt = entry
+                    last_stmt = entry
                 if ly0 >= HDR_BAND:
                     continue
-                sig = _hdr_sig("".join(s["text"] for s in line["spans"]))
                 if len(sig) >= 4:
                     seen.add((sig, round(ly0 / 3.0)))
+                    if "附注" in sig and page.number not in notes_cand:
+                        notes_cand[page.number] = {
+                            "kind": "notes",
+                            "name": sig,
+                            "text": txt,
+                            "bbox": (lx0, ly0, lx1, ly1),
+                        }
         for k in seen:
             counts[k] = counts.get(k, 0) + 1
+        if top_stmt is not None:
+            cap_pages[page.number] = top_stmt
+        if last_stmt is not None:
+            cap_sessions[page.number] = last_stmt
+        if top_stmt is not None or page.number in notes_cand:
+            plines[page.number] = page_lines
 
     floor = max(HDR_MIN_PAGES, HDR_MIN_FRAC * len(doc))
     sigs = {sig for (sig, _), n in counts.items() if n >= floor}
+    # Class B 附注页眉: only a signature the running-header consensus actually
+    # strips is a lost caption worth re-emitting; statement entries win ties.
+    for pno, nentry in notes_cand.items():
+        if nentry["name"] in sigs and pno not in cap_pages:
+            cap_pages[pno] = nentry
+    # Caption-block context: the date/unit lines printed with the caption are
+    # deleted by the same partner rule (平安 p150 "2024年度").  Record the
+    # non-running-header lines in a ±2.2×line-height window below each
+    # caption so the output layer can restore the whole block, not just the
+    # statement name.  Company-name lines qualify as running-header sigs and
+    # are deliberately excluded — that trim is by design.
+    for pno, entry in cap_pages.items():
+        ex0, ey0, ex1, ey1 = entry["bbox"]
+        ch = max(ey1 - ey0, 6.0)
+        ctx = []
+        for (lx0, ly0, lx1, ly1, txt, sig) in plines.get(pno, ()):
+            if ly0 < ey0 - 0.2 * ch or ly0 > ey1 + 2.2 * ch:
+                continue
+            if abs(ly0 - ey0) < 1.0 and txt == entry["text"]:
+                continue                    # the caption line itself
+            if sig in sigs or _STMT_NAME_RE.match(sig):
+                continue                    # running header / another caption
+            if len(_re.sub(r"\s+", "", txt)) < 2:
+                continue
+            ctx.append({"text": txt, "bbox": (lx0, ly0, lx1, ly1)})
+        ctx.sort(key=lambda c: c["bbox"][1])
+        if ctx:
+            entry["context"] = ctx[:3]
     _hdr_sig_cache[key] = sigs
+    _stmt_cap_cache[key] = {"pages": cap_pages, "sessions": cap_sessions}
     return sigs
 
 

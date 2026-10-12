@@ -498,9 +498,20 @@ def _line_fragments(page: fitz.Page, box: Rect) -> List[dict]:
     clip = fitz.Rect(box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
     raw = page.get_text("rawdict", clip=clip)
     fragments: List[dict] = []
+    # B 轨留账项（行级 y 守卫）：外扩的使命是收「压线」字形——压线
+    # 行必然与 box 垂直重叠；完全落在 box 上边界之外（页眉带，诚志
+    # p63 形态）或下边界之外的行不是被检测 bbox 几何约束的表格内
+    # 容，clip 外扩把它们吸进重建网格（多出页眉行/污染行带）。
+    # 判据是「垂直重叠量 >0」，不是「重叠超过半个点」——检测框常把
+    # 末行截在框外（p272 末行数值带只探入框底 0.3pt，重叠 0.32pt 依
+    # 然是表格内容，须保留并 clamp 进末行）；而完全在框外的行（页眉
+    # 带）重叠 ≤0，被丢弃。容差只吸收浮点 fuzz。
+    y_tol = 0.01
     for block in raw.get("blocks", []):
         for line in block.get("lines", []):
             ly0, ly1 = line["bbox"][1], line["bbox"][3]
+            if min(ly1, box[3]) - max(ly0, box[1]) <= y_tol:
+                continue
             runs: List[List[dict]] = []
             for span in line.get("spans", []):
                 skey = id(span)
@@ -1158,7 +1169,7 @@ def _wrap_veto_pair(t_a: str, t_b: str) -> bool:
 
 
 _NUM_BLEED_LEFT = re.compile(r'\d$')
-_NUM_BLEED_RIGHT = re.compile(r'^[,，]\d')
+_NUM_BLEED_RIGHT = re.compile(r'^[,，]\d|^\d{2,}')
 _CJK_PAIR = re.compile(r'^[\u4e00-\u9fff]{2,}$')
 
 
@@ -1295,6 +1306,171 @@ def _dedup_numeric_text(text):
                     # 完整等值型：len(second) == len(num) 且 second == num → 保留
                     # （合法双列同值，不属 NUM-DUP 缺陷）
     return text
+
+
+# ── C1 orphan-paren repair ─────────────────────────────────────────────
+
+_PAREN_TAIL_RE = re.compile(r'\((\d{1,2})\s*$')
+
+
+def _repair_orphan_parens(cells):
+    """C1 fix: repair orphan parentheses split across narrow columns.
+
+    Glyph-level attribution parks a right-aligned "(3,271)"'s opening
+    paren — sometimes with the value's leading digit — in the
+    neighbouring cell.  Repairable shapes on one row (cells ordered by
+    column, all half-width, numeric side guarded):
+
+      · bare-or-extra "(" — a cell ends with "(" and the NEXT cell
+        starts with digits/comma, ends with ")" and has no "("
+        ("(" | "3,271)"  or  "(2,212,771) ( " | "2,210,480)"):
+        strip the trailing "(" from the left cell, prefix it to the
+        right cell.  Only the IMMEDIATE neighbour is considered — a
+        transfer across unrelated columns fuses values that never
+        belonged together (residual v1 bug: "(,191,797)").
+      · "(N" tail — a cell ends with "(<1-2 digits>" after a closed
+        value while the next cell starts with ","/digit, ends with ")"
+        and lacks "(" ("2,195,586) (2" | ",191,797)"): the tail carries
+        the value's opening paren AND its leading digit.
+
+    A ")" closer whose "(" lives in a non-adjacent cell is NOT
+    repaired here — that transfer is unsafe at text level; the
+    geometric rebuild (triggered by the numeric-gap / bisection
+    signatures) owns the full fix.
+    """
+    by_row = {}
+    for c in cells:
+        by_row.setdefault(c.row, []).append(c)
+
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: c.col)
+        for i in range(len(row_cells) - 1):
+            a, b = row_cells[i], row_cells[i + 1]
+            ta, tb = a.text.strip(), b.text.strip()
+            if not tb or "(" in tb or not tb.endswith(")"):
+                continue
+            # shape 2: "(N" tail after a closed numeric value
+            m = _PAREN_TAIL_RE.search(ta)
+            if m:
+                head = ta[:m.start()].rstrip()
+                if head and head[-1] in ").]" and re.match(r'^[\d,，.\-]', tb):
+                    a.text = head
+                    b.text = "(" + m.group(1) + tb
+                    continue
+            # shape 1: bare-or-extra "(" orphan
+            if ta.endswith("(") and re.match(r'^[\d,，.\-]', tb):
+                a.text = ta[:-1].rstrip()
+                b.text = "(" + tb
+    return cells
+
+
+# ── C1 digit-bisection repair & trigger ────────────────────────────────
+
+# "1,064 1": closed number + word-gap + 1-2 digit orphan tail
+_BISECT_TAIL_RE = re.compile(r'^(\d[\d,，.]*\d%?|\d) (\d{1,2})$')
+# "38": short all-digit run — the neighbour that lost its tail
+_BISECT_SHORT_RE = re.compile(r'^\d{1,2}$')
+# "1,316,7": value cut inside a thousand group (ends ",d" / ",dd")
+_BISECT_MID_RE = re.compile(r'\d,\d{1,2}$')
+
+
+def _repair_split_digits(cells):
+    """C1 fix: re-join digits bisected across a narrow column boundary.
+
+    Glyph-level attribution parks the trailing 1-2 digits of a value in
+    the cell to the LEFT of the one the value belongs to — true
+    "1,064 | 381" surfaces as "1,064 1" | "38" (documented C1 shape).
+    The orphan tail sits behind a word gap inside the left cell, and
+    the right cell is a short pure-digit run; the true value is the
+    right cell's digits + the tail ("38"+"1" = "381", "1"+"0" = "10").
+
+    Guards: left head must be a pure closed numeric value (no prose),
+    tail 1-2 digits, right cell ≤2 digits — a multi-token prose cell
+    ("本期 5") or a full neighbour value ("1,258") never fires.
+    """
+    by_row = {}
+    for c in cells:
+        by_row.setdefault(c.row, []).append(c)
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: c.col)
+        for i in range(len(row_cells) - 1):
+            a, b = row_cells[i], row_cells[i + 1]
+            ta, tb = a.text.strip(), b.text.strip()
+            m = _BISECT_TAIL_RE.match(ta)
+            if not m or not _BISECT_SHORT_RE.match(tb):
+                continue
+            a.text = m.group(1)
+            b.text = tb + m.group(2)
+    return cells
+
+
+def _bisect_suspect(cells) -> bool:
+    """
+    C1 trigger: numeric bisection signatures that only exist in the
+    cell TEXT (region text itself is intact):
+
+      · tail bisection — closed number + gap + 1-2 digit tail in one
+        cell with a short all-digit neighbour ("1,064 1" | "38");
+      · mid-group cut — a value ends inside a thousand group
+        ("1,316,7") with a digit-starting neighbour ("61.90").
+
+    One signature suffices: a genuine number is never shaped like
+    either, and the rebuild's own recall/structure guards veto a bad
+    rebuild attempt.
+    """
+    if not cells:
+        return False
+    by_row = {}
+    for c in cells:
+        by_row.setdefault(c.row, []).append(c)
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: c.col)
+        for i in range(len(row_cells) - 1):
+            ta = row_cells[i].text.strip()
+            tb = row_cells[i + 1].text.strip()
+            if not ta or not tb:
+                continue
+            m = _BISECT_TAIL_RE.match(ta)
+            if m and _BISECT_SHORT_RE.match(tb):
+                return True
+            if (_BISECT_MID_RE.search(ta)
+                    and re.match(r'^\d', tb)
+                    and re.match(r'^[\d,，.\-()（]+$', ta)):
+                return True
+    return False
+
+
+# ── C1 numeric space → comma ───────────────────────────────────────────
+
+_NUM_SPACE_RE = re.compile(r'(\d{1,3}) (\d{3})(?!\d)')
+
+
+def _fix_numeric_spaces(text):
+    """C1 fix: convert space-separated digit groups to comma-separated.
+
+    "2 502" -> "2,502", "174 640" -> "174,640".
+    Only fires when digit share >= 60% (numeric cell).
+    """
+    digits = sum(1 for c in text if c.isdigit())
+    total = max(len(text), 1)
+    if digits / total < 0.6:
+        return text
+    return _NUM_SPACE_RE.sub(r'\1,\2', text)
+
+
+def _apply_text_repairs(cells):
+    """The C1 cosmetic bundle applied on every complete_table exit path."""
+    cells = _fix_cell_text_spaces(cells)
+    cells = _repair_orphan_parens(cells)
+    cells = _repair_split_digits(cells)
+    return cells
+
+
+def _fix_cell_text_spaces(cells):
+    """Apply _fix_numeric_spaces to every cell."""
+    for c in cells:
+        c.text = _fix_numeric_spaces(c.text)
+    return cells
 
 
 def _dedup_date_newlines(cells):
@@ -1505,12 +1681,18 @@ def _numeric_gap(page: fitz.Page, table_bbox: Rect,
                  cells: List[CellOutput]) -> int:
     """
     Count numeric tokens of the region text that are absent from the
-    cells' text (comma/space-insensitive substring test).  SLANet cell
+    cells' text (comma/space-insensitive containment test).  SLANet cell
     bboxes sometimes amputate the last glyph of a right-aligned value
     ('25,688' → '25,68') — one or two chars below the uncovered-text
     ratio trigger, but fatal for a financial corpus.
+
+    The test is PER CELL, not over the joined row/table text: a token
+    reassembled only by concatenating text from DIFFERENT cells
+    ("2,195,586) (2" + ",191,797)" incidentally contains "2191797")
+    is exactly the cross-column bisection corruption the rebuild fixes.
     """
-    text = "".join(c.text for c in cells).replace(",", "").replace(" ", "")
+    cell_texts = [c.text.replace(",", "").replace(" ", "")
+                  for c in cells]
     clip = fitz.Rect(table_bbox[0] - 4.0, table_bbox[1] - 4.0,
                      table_bbox[2] + 4.0, table_bbox[3] + 4.0)
     region = page.get_text("text", clip=clip)
@@ -1519,7 +1701,7 @@ def _numeric_gap(page: fitz.Page, table_bbox: Rect,
         v = tok.replace(",", "").replace(" ", "")
         if len(v) < 3 or re.fullmatch(r"(19|20)\d{2}", v):
             continue
-        if v not in text:
+        if not any(v in ct for ct in cell_texts):
             missing += 1
     return missing
 
@@ -1546,7 +1728,11 @@ def complete_table(page: fitz.Page,
     if not (needs_completion(page, table_bbox, cells)
             or structure_suspect(page, table_bbox, cells)
             or (table_bbox is not None and cells
-                and _numeric_gap(page, table_bbox, cells) > 0)):
+                and _numeric_gap(page, table_bbox, cells) > 0)
+            or (cells and _bisect_suspect(cells))):
+        # No geometric trigger, but char-level repairs are still safe and
+        # idempotent on a healthy grid — they only rewrite cell TEXT.
+        cells = _apply_text_repairs(cells)
         return cells, num_rows, num_cols, False
 
     new_cells, new_rows, new_cols, new_edges, rows = rebuild_grid(
@@ -1555,6 +1741,8 @@ def complete_table(page: fitz.Page,
             cells, _table_scale_cached(page, table_bbox)),
         src_cols=num_cols)
     if not new_cells:
+        _log.debug("completion rebuild produced no grid; keeping SLANet cells")
+        cells = _apply_text_repairs(cells)
         return cells, num_rows, num_cols, False
 
     ref = Counter(_norm(page.get_text(
@@ -1563,6 +1751,7 @@ def complete_table(page: fitz.Page,
     after = _recall(ref, new_cells)
     if after + 1e-9 < before:
         _log.debug(f"completion declined (recall {before:.3f}→{after:.3f})")
+        cells = _apply_text_repairs(cells)
         return cells, num_rows, num_cols, False
 
     # Structure guard: a rebuild that collapses columns must prove the
@@ -1577,10 +1766,12 @@ def complete_table(page: fitz.Page,
         if old_viol <= new_viol:
             _log.debug(f"completion declined (cols {num_cols}→{new_cols}, "
                        f"violations {old_viol}→{new_viol})")
+            cells = _apply_text_repairs(cells)
             return cells, num_rows, num_cols, False
 
     _log.info(f"completion: rebuilt {num_rows}x{num_cols} SLANet grid as "
               f"{new_rows}x{new_cols} (text recall {before:.3f}→{after:.3f})")
     new_cells = _dedup_cell_text(new_cells)
     new_cells = _dedup_date_newlines(new_cells)
+    new_cells = _apply_text_repairs(new_cells)
     return new_cells, new_rows, new_cols, True

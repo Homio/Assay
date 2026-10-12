@@ -825,6 +825,325 @@ def _chars_to_text(chars: List[Tuple[float, float, float, float, str, float]]
     return "".join(parts).strip()
 
 
+def _running_header_rects(
+    page: fitz.Page, header_sigs: Optional[set]
+) -> List[Tuple[float, float, float, float]]:
+    """C3 页眉防吸入（表格链路）：本书跨页共识页眉行的 bbox。
+
+    extract_page_text 的页眉过滤只作用于文本链路；表格链路
+    （_table_char_index 的 pad 外扩、completion 重建的 clip 吸入）
+    会把表格 bbox 上缘附近的页眉行拉进单元格（诚志 p63 r0c1 粘入
+    "诚志股份有限公司 2025 年年度报告全文"）。判定与 extract_page_text
+    完全同源：签名 = 去数字去空白后的整行文本，命中全书共识
+    （calibrate_page_headers 学习，≥HDR_MIN_PAGES 页重复），且行
+    y0 < 90（顶部条带）。命中行的同视觉行伙伴（y 重叠 ±2pt，页眉
+    常由两个 line 对象组成）一并计入。返回外扩 1pt 的 rect 列表，
+    供表格字形归属阶段整行排除。
+    """
+    if not header_sigs:
+        return []
+    lines: List[Tuple[float, float, float, float, str]] = []
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            txt = "".join(s.get("text", "")
+                          for s in line.get("spans", [])).strip()
+            if not txt:
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            lines.append((x0, y0, x1, y1, txt))
+    if not lines:
+        return []
+    hdr_idx = set()
+    for i, (_x0, y0, _x1, _y1, txt) in enumerate(lines):
+        if y0 < 90.0:
+            sig = re.sub(r"[\d\s]+", "", txt)
+            if len(sig) >= 4 and sig in header_sigs:
+                hdr_idx.add(i)
+    if not hdr_idx:
+        return []
+    grown: set = set()
+    for i in hdr_idx:
+        grown.add(i)
+        y0, y1 = lines[i][1], lines[i][3]
+        for j, (a, b) in enumerate((l[1], l[3]) for l in lines):
+            if j == i or j in grown:
+                continue
+            if a < y1 + 2 and b > y0 - 2:
+                grown.add(j)
+    rects: List[Tuple[float, float, float, float]] = []
+    for i in grown:
+        x0, y0, x1, y1 = lines[i][:4]
+        # 共识页眉永远在顶部条带；同视觉行伙伴不可能深入正文区
+        if y0 < 100.0:
+            rects.append((x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0))
+    return rects
+
+
+def _strip_header_lines(
+    cells: List[CellOutput], page: fitz.Page,
+    header_rects: List[Tuple[float, float, float, float]]
+) -> List[CellOutput]:
+    """C3 页眉防吸入（重建链路）：从最终单元格文本中删除页眉行。
+
+    build_table_from_slanet 的字形过滤覆盖 SLANet 网格路径；
+    complete_table 的几何重建直接重读页面（_line_fragments 的
+    pad 外扩），页眉行仍会被重建进首行单元格。这里按"归一化后
+    整行相等 → 删行；归一化后包含 → 正则摘除"两级处理单元格文
+    本，与全书共识页眉（绝不可能是表格数据）严格匹配。
+    """
+    hdr_norms = []
+    for hx0, hy0, hx1, hy1 in header_rects:
+        try:
+            txt = page.get_text("text", clip=fitz.Rect(hx0, hy0,
+                                                       hx1, hy1))
+        except Exception:
+            continue
+        norm = re.sub(r"\s+", "", txt)
+        if len(norm) >= 4:
+            hdr_norms.append(norm)
+    if not hdr_norms:
+        return cells
+    # 几何门控：页眉物理上只能被吸入表的顶部条带（页眉 rect 的
+    # y1 之上）。平安银行页眉签名为公司名等通用文本，与表内数据行
+    # 撞文本——纯文本匹配会误删表中部合法行（p5/p106/p218 等 23
+    # 处 trec 回归的根因）。只对 bbox 顶部落在页眉带 +2pt 容差内
+    # 的单元格做摘除，其余单元格原样保留。
+    hdr_y_limit = max(hy1 for _hx0, hy0, _hx1, hy1 in header_rects) + 2.0
+    hdr_set = set(hdr_norms)
+    pats = [(n, re.compile(r"\s*".join(re.escape(c) for c in n)))
+            for n in hdr_norms]
+    for c in cells:
+        if not c.text:
+            continue
+        if c.bbox[1] > hdr_y_limit:
+            continue
+        out_lines = []
+        for ln in c.text.split("\n"):
+            norm = re.sub(r"\s+", "", ln)
+            if norm in hdr_set:
+                continue
+            stripped = ln
+            for _n, pat in pats:
+                if _n in norm and len(norm) > len(_n):
+                    stripped = pat.sub("", stripped).strip()
+            if stripped:
+                out_lines.append(stripped)
+        new_text = "\n".join(out_lines)
+        if new_text != c.text:
+            c.text = new_text
+    return cells
+
+
+def _enforce_line_atomicity(
+    assigned: List[List], all_chars: List, cell_rects: List,
+    cell_meta: List, med_cs: float
+) -> List[List]:
+    """C3 行原子化：同一视觉文本行（rawdict line，同一 ly0）的字形
+    绝不跨网格行拆分；行内跨格拆分只允许发生在真实字形间隙
+    （≥0.4×中位字号）且两侧字形都落在各自格的 x 范围内。
+
+    乱跨度网格（恒逸 p105 SLANet 6x15）把折行正文按字形劈进同行
+    多格（"上述关联交易有利/按类别…/定的电价为定价" 三段同格交
+    错）、竖排名单尾字劈进邻列（诚志 p63 "清/诚/融" 落 c0）。违反
+    上述两条的行/行内簇整体归"包含簇中心的格"（无含格时归多数
+    格，并列取最左），与既有三级归属（containment→重叠→最近）互
+    补：三级归属解决"格该归谁"，本函数解决"行不许被格边切碎"。
+    """
+    if not all_chars or not cell_rects:
+        return assigned
+    ch_cell: dict = {}
+    for ci, chs in enumerate(assigned):
+        for ch in chs:
+            ch_cell[id(ch)] = ci
+    gap_thr = 0.4 * med_cs
+    by_line: dict = {}
+    for ch in all_chars:
+        by_line.setdefault(ch[5], []).append(ch)
+    for _ly, chs in by_line.items():
+        chs.sort(key=lambda c: c[0])
+        clusters: List[List] = [[chs[0]]]
+        for ch in chs[1:]:
+            if ch[0] - clusters[-1][-1][2] >= gap_thr:
+                clusters.append([ch])
+            else:
+                clusters[-1].append(ch)
+        for cl in clusters:
+            holders: dict = {}
+            for ch in cl:
+                ci = ch_cell.get(id(ch))
+                if ci is not None:
+                    holders.setdefault(ci, []).append(ch)
+            if len(holders) < 2:
+                continue
+            # 纯数字簇跳过：密排数值列的跨格拆粘由 _glue_numeric_seeps
+            # 专责（"2,707,138.3|4"），此处重聚会回退其归位结果
+            if sum(1 for ch in cl if ch[4] in _NUM_CHARS) \
+                    >= 0.6 * len(cl):
+                continue
+            rows = {cell_meta[ci][0] for ci in holders}
+            cross_row = len(rows) >= 2
+            # 同行拆分仍可能是真分列（"周 松" 双名列、混排日期）：
+            # 要求每个持有格的字形都落在该格 x 范围（±1pt）内——经
+            # 包络/兜底路径漂进远格的字形（交错签名的成因）不满足；
+            # 且持有格 x 范围两两不重叠（真列间有 gutter，乱跨度网
+            # 格的同行格互相压叠 x 领地，如恒逸 p105 r2c4 与 r2c11
+            # 压叠 75pt，把同一折行行劈成两段）
+            outside = any(
+                ch[0] < cell_rects[ci][0] - 1.0
+                or ch[2] > cell_rects[ci][2] + 1.0
+                for ci, hchs in holders.items() for ch in hchs)
+            if not cross_row and not outside:
+                xr = sorted((cell_rects[ci][0], cell_rects[ci][2])
+                            for ci in holders)
+                overlap = any(
+                    xr[i + 1][0] < xr[i][1] - 0.8 * med_cs
+                    for i in range(len(xr) - 1))
+                if not overlap:
+                    continue
+            cx = (cl[0][0] + cl[-1][2]) / 2.0
+            cy = (min(c[1] for c in cl) + max(c[3] for c in cl)) / 2.0
+            contain = [ci for ci in holders
+                       if cell_rects[ci][0] - 0.5 <= cx
+                       <= cell_rects[ci][2] + 0.5
+                       and cell_rects[ci][1] - 0.5 <= cy
+                       <= cell_rects[ci][3] + 0.5]
+            if contain:
+                target = min(
+                    contain,
+                    key=lambda ci: ((cell_rects[ci][2] - cell_rects[ci][0])
+                                    * (cell_rects[ci][3] - cell_rects[ci][1])))
+            else:
+                target = max(
+                    holders.items(),
+                    key=lambda kv: (len(kv[1]), -kv[0]))[0]
+            moved = [ch for hchs in holders.values() for ch in hchs]
+            for ci in holders:
+                drop = {id(ch) for ch in holders[ci]}
+                assigned[ci] = [ch for ch in assigned[ci]
+                                 if id(ch) not in drop]
+            assigned[target].extend(moved)
+    return assigned
+
+
+def _region_xstart_columns(
+    page: fitz.Page, table_bbox: Tuple[float, float, float, float],
+    header_rects: Optional[
+        List[Tuple[float, float, float, float]]] = None
+) -> int:
+    """C3 重建坍缩守卫用：区域文本的持久片段 x 起点簇数。
+
+    竖排名单、日期、状态列的字形常与相邻列合并在同一 rawdict 行
+    对象里（诚志 p63 "天府清2016年" 一行含公司列+日期列），行级
+    x0 看不见这些列；按行内真实字形间隙（≥0.4×中位字号）切成片
+    段后取片段 x0，同列折行/竖排块的片段 x0 一致（±0.6×中位字
+    号），聚类统计"≥2 个片段成员"的簇数——即区域真实列起点数。
+    页眉 rect 内的字形先行排除（表格上缘 pad 吸入的页眉会形成幻
+    影簇）。
+    """
+    try:
+        chars = _table_char_index(page, table_bbox)
+    except Exception:
+        return 0
+    if header_rects:
+        def _in_hdr(ch) -> bool:
+            cx, cy = (ch[0] + ch[2]) / 2.0, (ch[1] + ch[3]) / 2.0
+            return any(hx0 <= cx <= hx1 and hy0 <= cy <= hy1
+                       for hx0, hy0, hx1, hy1 in header_rects)
+        chars = [ch for ch in chars if not _in_hdr(ch)]
+    if not chars:
+        return 0
+    med = _median_char_size(chars)
+    by_line: dict = {}
+    for ch in chars:
+        by_line.setdefault(ch[5], []).append(ch)
+    frag_x0s: List[float] = []
+    gap_thr = 0.4 * med
+    for chs in by_line.values():
+        chs.sort(key=lambda c: c[0])
+        frag_x0s.append(chs[0][0])
+        for a, b in zip(chs, chs[1:]):
+            if b[0] - a[2] >= gap_thr:
+                frag_x0s.append(b[0])
+    if not frag_x0s:
+        return 0
+    tol = 0.6 * med
+    frag_x0s.sort()
+    clusters: List[List[float]] = [[frag_x0s[0]]]
+    for v in frag_x0s[1:]:
+        if v - clusters[-1][-1] > tol:
+            clusters.append([v])
+        else:
+            clusters[-1].append(v)
+    # 只统计"≥2 片段成员"的簇：单次出现的孤值（行内随机词距、
+    # 一次性标注）不构成列签名
+    counts: dict = {}
+    for v in frag_x0s:
+        for cl in clusters:
+            if cl[0] - tol <= v <= cl[-1] + tol:
+                counts[id(cl)] = counts.get(id(cl), 0) + 1
+                break
+    return sum(1 for cl in clusters if counts.get(id(cl), 0) >= 2)
+
+
+def _region_has_wide_wrapped_prose(
+    page: fitz.Page, table_bbox: Tuple[float, float, float, float],
+    header_rects: Optional[
+        List[Tuple[float, float, float, float]]] = None
+) -> bool:
+    """C3 重建坍缩守卫用：区域是否含通栏折行正文段。
+
+    正文被吸进表格是 C3 的形态学签名（诚志 p63 600 字独立性承诺、
+    恒逸 p105 关联交易说明）：≥3 条 y 相邻、同 x0（±0.6×中位字号）、
+    每条 ≥8 字、宽 ≥0.4×区域宽、数字占比 <50% 的连续折行行。密排
+    数值表（右对齐散布）与窄标签列不满足——防止幻影 x 簇误触发守卫
+    拒收正常重建（三书门禁 31 处回归的根因）。
+    """
+    try:
+        chars = _table_char_index(page, table_bbox)
+    except Exception:
+        return False
+    if header_rects:
+        def _in_hdr(ch) -> bool:
+            cx, cy = (ch[0] + ch[2]) / 2.0, (ch[1] + ch[3]) / 2.0
+            return any(hx0 <= cx <= hx1 and hy0 <= cy <= hy1
+                       for hx0, hy0, hx1, hy1 in header_rects)
+        chars = [ch for ch in chars if not _in_hdr(ch)]
+    if not chars:
+        return False
+    med = _median_char_size(chars)
+    bw = table_bbox[2] - table_bbox[0]
+    by_line: dict = {}
+    for ch in chars:
+        by_line.setdefault(ch[5], []).append(ch)
+    lns = []
+    for chs in by_line.values():
+        chs.sort(key=lambda c: c[0])
+        txt = "".join(c[4] for c in chs)
+        numc = sum(1 for c in chs if c[4] in _NUM_CHARS)
+        lns.append({
+            "x0": chs[0][0], "y0": min(c[1] for c in chs),
+            "n": len(chs), "txt": txt,
+            "prose": (len(chs) >= 8
+                      and chs[-1][2] - chs[0][0] >= 0.4 * bw
+                      and numc < 0.5 * len(chs))})
+    lns.sort(key=lambda l: (l["y0"], l["x0"]))
+    run = best = 0
+    for i, l in enumerate(lns):
+        if not l["prose"]:
+            run = 0
+            continue
+        if i > 0 and lns[i - 1]["prose"] \
+                and abs(l["x0"] - lns[i - 1]["x0"]) <= 0.6 * med \
+                and 0 < l["y0"] - lns[i - 1]["y0"] <= 2.2 * med:
+            run += 1
+        else:
+            run = 1
+        best = max(best, run)
+    return best >= 3
+
+
 def build_table_from_slanet(
     slanet_result: Dict,
     page: fitz.Page,
@@ -832,6 +1151,8 @@ def build_table_from_slanet(
     scale_x: float,
     scale_y: float,
     table_bbox: Optional[Tuple[float, float, float, float]] = None,
+    header_rects: Optional[
+        List[Tuple[float, float, float, float]]] = None,
 ) -> Optional[TableOutput]:
     """
     Convert SLANet output into a TableOutput with extracted cell text.
@@ -871,6 +1192,8 @@ def build_table_from_slanet(
         cells, nr, nc, _edges, _rows = rebuild_grid(page, table_bbox)
         if not cells:
             return None
+        if header_rects:
+            cells = _strip_header_lines(cells, page, header_rects)
         _log.info(f"p{page_idx + 1} SLANet {why} — geometric rebuild, "
                   f"bbox={table_bbox}")
         return TableOutput(
@@ -912,6 +1235,16 @@ def build_table_from_slanet(
             all_chars = _table_char_index(page, table_bbox)
         except Exception:
             all_chars = []
+
+    # C3 页眉防吸入：表格 bbox 上缘 pad 范围内的共识页眉字形整行
+    # 排除（诚志 p63 页眉 y43-53 经 pad 外扩吸进 r0c1）。页眉行是
+    # 全书重复的家具文本，绝不可能是表格数据
+    if header_rects and all_chars:
+        def _in_hdr(ch) -> bool:
+            cx, cy = (ch[0] + ch[2]) / 2.0, (ch[1] + ch[3]) / 2.0
+            return any(hx0 <= cx <= hx1 and hy0 <= cy <= hy1
+                       for hx0, hy0, hx1, hy1 in header_rects)
+        all_chars = [ch for ch in all_chars if not _in_hdr(ch)]
 
     cell_rects: List[Tuple[float, float, float, float]] = []
     cell_meta: List[Tuple[int, int, int, int, tuple]] = []
@@ -1018,6 +1351,9 @@ def build_table_from_slanet(
     if all_chars and cell_rects:
         _glue_numeric_seeps(assigned, cell_meta,
                             _median_char_size(all_chars))
+        # C3 行原子化：行不被格边切碎（见 _enforce_line_atomicity）
+        assigned = _enforce_line_atomicity(
+            assigned, all_chars, cell_rects, cell_meta, _med_y)
 
     for i in range(n_cells):
         start_row, end_row, start_col, end_col, pdf_bbox = cell_meta[i]
@@ -1216,10 +1552,12 @@ class AssayExtractor:
                     continue
 
                 scale_x, scale_y = _page_cache[page_idx]
+                page_hdr_rects = _running_header_rects(page, header_sigs)
 
                 for sres, table_bbox in slanet_data:
                     table_out = build_table_from_slanet(
-                        sres, page, page_idx, scale_x, scale_y, table_bbox
+                        sres, page, page_idx, scale_x, scale_y, table_bbox,
+                        header_rects=page_hdr_rects
                     )
                     if table_out is None:
                         continue
@@ -1258,11 +1596,52 @@ class AssayExtractor:
                         new_cells, nnr, nnc, done = complete_table(
                             page, table_bbox, table_out.cells,
                             table_out.num_rows, table_out.num_cols)
+                        # C3 重建坍缩拒收：几何重建把多列表压成少数粗
+                        # 列、而区域行 x 起点簇数表明真实列数远多于此
+                        # （诚志 p63：7 列承诺表压成 2 列，600 字正文与
+                        # 标签错挂、竖排名单劈散），拒绝重建、保留经行
+                        # 原子化 + 页眉过滤的 SLANet 网格。SLANet 误读
+                        # 出多余列的真坍缩场景（区域 x 起点簇数本就少）
+                        # 不受影响，仍由 complete_table 自身守卫裁决
+                        if done and nnc < table_out.num_cols:
+                            _xcols = _region_xstart_columns(
+                                page, table_bbox, page_hdr_rects)
+                            # 第二条件收窄到 C3 形态学签名：区域内存
+                            # 在通栏折行正文段（≥3 条 y 邻接、同 x0、
+                            # 低数字占比的宽行）。密排数值表（右对齐
+                            # 散点起点簇多但无正文段）不受守卫影响，
+                            # 仍允许 complete_table 正常坍缩重建
+                            if _xcols >= max(table_out.num_cols,
+                                             nnc + 3) \
+                                    and _region_has_wide_wrapped_prose(
+                                        page, table_bbox,
+                                        page_hdr_rects):
+                                _log.info(
+                                    f"p{page_idx + 1} C3 rebuild "
+                                    f"declined: {nnc} cols < "
+                                    f"{_xcols} x-start columns")
+                                done = False
+                                # 与 complete_table 自身拒绝路径的修饰处理
+                                # 保持一致（空格/括号修复）。两个 helper 为
+                                # completion.py 侧新增接口，缺省时跳过修饰
+                                # 保持对基线的兼容
+                                try:
+                                    from assay.completion import (
+                                        _fix_cell_text_spaces,
+                                        _repair_orphan_parens)
+                                    table_out.cells = _repair_orphan_parens(
+                                        _fix_cell_text_spaces(
+                                            table_out.cells))
+                                except ImportError:
+                                    pass
                         if done:
                             table_out.cells = new_cells
                             table_out.num_rows = nnr
                             table_out.num_cols = nnc
                             table_out.completed = True
+                        if page_hdr_rects:
+                            table_out.cells = _strip_header_lines(
+                                table_out.cells, page, page_hdr_rects)
                         result.tables.append(table_out)
 
         except Exception as e:
