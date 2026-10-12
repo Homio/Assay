@@ -74,8 +74,9 @@ RE_PAREN_NEG = re.compile(
 # 连续负号 + 数字（双负号按奇偶归并）
 RE_MULTI_MINUS = re.compile(r'(--+)\s*(' + _NUM_CORE + r')')
 # 数字内部的空格（千分位逗号后的空格粘连）
+# 前瞻式（尾随数字不进匹配）：连续多处 `1, 234, 567` 单遍即可全部收敛
 RE_NUM_INNER_SPACE = re.compile(
-    r'(\d),\s+(\d{3})|(\d)\s+(\.\d)')
+    r'\d,\s+(?=\d{3})|\d\s+(?=\.\d)')
 # 表行级括号跨格切分，两种严格形态：
 #   形态1：`| - ( | 687,860,833.00) |` —— A=[负号+]左括号，B=数字+右括号
 #   形态2：`| - | (117,039,002.86) |`  —— A=裸负号，B=括号负数
@@ -101,7 +102,7 @@ _FW_MAP.update(_FW_LOWER)
 _FW_MAP.update({'\uff05': '%', '\uff0e': '.', '\u3000': ' '})
 # 全角括号且内部是数字 → 转半角括号（仅数字上下文，避免动正文）
 RE_FW_PAREN_NUM = re.compile(
-    r'\uff08\s*([0-9,\\.\\s]+?)\s*\uff09')
+    r'\uff08\s*([0-9\uff10-\uff19,.\uff0e\s]+?)\s*\uff09')
 
 
 def fw_to_half(text: str) -> str:
@@ -159,23 +160,33 @@ def normalize_text(text: str, report: '_Report | None' = None,
     # -- 复选符号白名单 --
     if 'checked' in on:
         for alias in CHECKED_ALIASES:
-            if alias in text:
+            if alias != CHECKED and alias in text:
                 rep.hit('check_symbol_checked', alias + ' -> ' + CHECKED)
                 text = text.replace(alias, CHECKED)
     if 'unchecked' in on:
         for alias in UNCHECKED_ALIASES:
-            if alias in text:
+            if alias != UNCHECKED and alias in text:
                 rep.hit('check_symbol_unchecked', alias + ' -> ' + UNCHECKED)
                 text = text.replace(alias, UNCHECKED)
 
     # -- 单位字符串标准化：`单位:元`/`单位 ： 元` → `单位：元` --
     if 'unit' in on:
         def _unit_sub(m):
-            rep.hit('unit_string', m.group(0))
+            if m.group(0) != '单位：':
+                rep.hit('unit_string', m.group(0))
             return '单位：'
         text = RE_UNIT_LINE.sub(_unit_sub, text)
 
     # -- 数值格式 --
+    # 4d. 数字内部空格（先于括号负数规则：`（1, 234.56）` 须先收敛成
+    #     (1,234.56)，paren_neg 才能在同一遍命中——否则二次应用才生效，
+    #     破坏幂等）
+    if 'num_space' in on:
+        def _num_space_sub(m):
+            rep.hit('number_inner_space', m.group(0))
+            return re.sub(r'\s+', '', m.group(0))
+        text = RE_NUM_INNER_SPACE.sub(_num_space_sub, text)
+
     # 4a. - ( 687,860,833.00 ) → -687,860,833.00
     if 'minus_paren' in on:
         def _minus_paren_sub(m):
@@ -199,13 +210,6 @@ def normalize_text(text: str, report: '_Report | None' = None,
             signs = len(m.group(1))
             return m.group(2) if signs % 2 == 0 else '-' + m.group(2)
         text = RE_MULTI_MINUS.sub(_multi_minus_sub, text)
-
-    # 4d. 数字内部空格
-    if 'num_space' in on:
-        def _num_space_sub(m):
-            rep.hit('number_inner_space', m.group(0))
-            return (m.group(0) or '').replace(' ', '')
-        text = RE_NUM_INNER_SPACE.sub(_num_space_sub, text)
 
     return text, text != orig
 

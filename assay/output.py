@@ -11,6 +11,7 @@ Coordinate system: all bbox values are in PDF points (native PDF units).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field, asdict
@@ -452,11 +453,43 @@ def _apply_caption_plan(doc: DocumentOutput) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# C7 交付通道 normalize 挂载（trackG，2026-10-12）
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# D 轨 assay/normalize.py 的交付通道挂载点（INTERFACE_REQUESTS.md §2 请求）：
+# 位置在评分之后——eval/score.py 只读 JSON 产物（export_to_dict 不经过
+# normalize），本挂载仅作用于交付 Markdown；JSON 的 texts/tables/grid/prov
+# 与 page_no（0 基）逐字节不变，门禁打分永远用原始抽取产物。
+#
+# 开关（默认启用），优先级：显式参数 normalize= > 环境变量 ASSAY_NORMALIZE：
+#   ASSAY_NORMALIZE=0 python3 assay.py -p x.pdf -o out/   # 关闭（交付 md 原样）
+#   write_markdown(doc, path, normalize=False)             # 关闭（单调用级）
+
+try:
+    from .normalize import normalize_markdown as _normalize_markdown
+except Exception:                    # normalize.py 缺失时交付通道原样直通
+    _normalize_markdown = None
+
+
+def _normalize_enabled(explicit: Optional[bool]) -> bool:
+    """交付通道 normalize 开关：显式参数 > ASSAY_NORMALIZE 环境变量 > 默认开。"""
+    if explicit is not None:
+        return explicit
+    env = (os.environ.get("ASSAY_NORMALIZE") or "").strip().lower()
+    return env not in ("0", "false", "no", "off")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Markdown export
 # ──────────────────────────────────────────────────────────────────────────────
 
-def export_to_markdown(doc: DocumentOutput) -> str:
-    """Export document as Markdown string with text and tables interleaved by page."""
+def export_to_markdown(doc: DocumentOutput,
+                       normalize: Optional[bool] = None) -> str:
+    """Export document as Markdown string with text and tables interleaved by page.
+
+    normalize: C7 交付通道规范化开关（None = 读环境变量 ASSAY_NORMALIZE，
+    默认启用）。只影响交付 md，不触碰 JSON 产物 / eval 输入。
+    """
     plan = _apply_caption_plan(doc)          # C2/C6: restore/dedupe/strip/mark
     page_heights = {p.page_no: p.height for p in doc.pages if p.height > 0}
     lines: List[str] = []
@@ -525,7 +558,11 @@ def export_to_markdown(doc: DocumentOutput) -> str:
                 lines.append(_table_to_md(obj))
                 lines.append("")
 
-    return "\n".join(lines)
+    md = "\n".join(lines)
+    # C7 挂载点：评分之后的交付通道（md-only；JSON/prov/page_no 不动）
+    if _normalize_enabled(normalize) and _normalize_markdown is not None:
+        md, _norm_report = _normalize_markdown(md)
+    return md
 
 
 def _table_top(table: TableOutput) -> float:
@@ -747,9 +784,14 @@ def _build_grid_json(table: TableOutput) -> List[List[dict]]:
     return result
 
 
-def write_markdown(doc: DocumentOutput, path: str) -> None:
-    """Write Markdown output to file."""
-    content = export_to_markdown(doc)
+def write_markdown(doc: DocumentOutput, path: str,
+                   normalize: Optional[bool] = None) -> None:
+    """Write Markdown output to file.
+
+    normalize: C7 交付通道规范化开关（None = 读环境变量 ASSAY_NORMALIZE，
+    默认启用）；传 False 可单调用关闭。
+    """
+    content = export_to_markdown(doc, normalize=normalize)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 

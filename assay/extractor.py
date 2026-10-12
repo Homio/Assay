@@ -1144,6 +1144,337 @@ def _region_has_wide_wrapped_prose(
     return best >= 3
 
 
+# ── C5 ruled-grid repair（B1 网格层）──────────────────────────────────────
+#
+# 根因（trackA §5 仲裁）：三形态跨格互粘的共同根因在 B1 的网格层——
+# SLANet 在有完整矢量线网格的 bordered 表上给出劣性布局（幻影空列、
+# 相邻列 bbox 包络互相压叠、行缘切进文本行中部）。B1 的字形三级归属
+# 再准也救不了网格本身；completion 的几何重建不感知矢量线列边，列边
+# 按文本 gutter 三候选竞争，名单折行文字超出线 2-3pt 时真列边（hint）
+# 带穿字被少列 gutter 候选击败（yj p35 7 真列坍缩成 4 列）。
+#
+# 机制：SLANet 网格呈劣性拓扑签名、且表区矢量线自身构成完整网格
+# （行线覆盖绝大多数文本带、全高列边 ≥3）时，用矢量线行列边重建
+# cell_rects/cell_meta，字形归属仍走原有三级归属 + 行原子化 + 数值
+# 归位，随后主流程对该表跳过 complete_table（straddle 检测会把合法
+# 的高折行行误判成行漂移触发重建），仅保留幂等文本修复。
+#
+# 铁律：全部阈值为相对阈值（×中位字号 / ×bbox 宽高 / ×包络宽），零
+# 页码/公司名/字符串常量；重建前以 _split_violations 守卫——矢量列
+# 边切穿文本 span 的数量不得高于 SLANet 网格，否则放弃重建、保持基
+# 线行为（保护跨列合并表头等真合并结构不被均匀网格拆散）。
+
+
+def _ruled_line_segments(
+    page: fitz.Page,
+    table_bbox: Tuple[float, float, float, float],
+) -> Tuple[List, List]:
+    """表区 ±4pt 内的轴向矢量线段（H, V），自建提取。
+
+    不复用 rulings.extract_line_segments：其 HEADER_ZONE 过滤会丢弃
+    上边距表格的顶线（横版页表格 y0=56 < 72），而顶线正是行边锚点。
+    """
+    bx0, by0, bx1, by1 = table_bbox
+    H: List = []
+    V: List = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return [], []
+    for d in drawings:
+        for it in d.get("items", ()):
+            if it[0] == "l":
+                p1, p2 = it[1], it[2]
+                if abs(p1.y - p2.y) < 0.5 and abs(p1.x - p2.x) > 0.5:
+                    H.append((min(p1.x, p2.x), max(p1.x, p2.x),
+                              (p1.y + p2.y) / 2))
+                elif abs(p1.x - p2.x) < 0.5 and abs(p1.y - p2.y) > 0.5:
+                    V.append((min(p1.y, p2.y), max(p1.y, p2.y),
+                              (p1.x + p2.x) / 2))
+            elif it[0] == "re":
+                r = it[1]
+                w, h = r.width, r.height
+                if d.get("fill") and min(w, h) < 1.5:
+                    # 细填充矩形：边框描边常以填充矩形出现
+                    if w <= h:
+                        V.append((r.y0, r.y1, (r.x0 + r.x1) / 2))
+                    else:
+                        H.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+                elif w < 0.5 and h > 0.5:
+                    V.append((r.y0, r.y1, (r.x0 + r.x1) / 2))
+                elif h < 0.5 and w > 0.5:
+                    H.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+    pad = 4.0
+    H = [s for s in H if by0 - pad <= s[2] <= by1 + pad]
+    V = [s for s in V if bx0 - pad <= s[2] <= bx1 + pad]
+    return H, V
+
+
+def _merge_axis_positions(segs: List, tol: float = 1.5) -> List:
+    """按轴位置（容差 tol）合并线段簇；返回 [(pos, lo, hi)]，pos 为簇
+    位置均值、lo/hi 为簇内区间的联合跨度。"""
+    groups: List = []
+    for s in sorted(segs, key=lambda t: t[2]):
+        pos, lo, hi = s[2], s[0], s[1]
+        if groups and abs(pos - groups[-1][0]) <= tol:
+            p, l0, h0 = groups[-1]
+            groups[-1] = ((p + pos) / 2, min(l0, lo), max(h0, hi))
+        else:
+            groups.append((pos, lo, hi))
+    return groups
+
+
+def _slanet_grid_pathology(cell_meta: List, cell_rects: List,
+                           all_chars: List, med: float,
+                           bbox: Tuple[float, float, float, float]
+                           ) -> Optional[str]:
+    """SLANet 网格的劣性拓扑签名（任一命中即劣性）。
+
+    (a1) 相邻列 x 包络压叠 —— 列包络互相越过对方的包络中线附近，
+         密排数值列的正常 6-8pt 边缘重叠远达不到该阈值；
+    (a2) 幻影空窄列 —— 宽 ≤1.5×中位字号且包络内无任何字形中心；
+    (c)  行缘切字 —— SLANet 行边切进文本行中部的行数（漂移网格
+         把行界切在字带中间，健康网格行边落在行间空白）。
+    """
+    bx0, by0, bx1, by1 = bbox
+    valid = [r for r in cell_rects if r[2] > r[0] and r[3] > r[1]]
+    if not valid:
+        return None
+    col_env: dict = {}
+    for (_sr, _er, sc, _ec, r) in cell_meta:
+        if r[2] <= r[0]:
+            continue
+        lo, hi = col_env.get(sc, (r[0], r[2]))
+        col_env[sc] = (min(lo, r[0]), max(hi, r[2]))
+    envs = sorted(col_env.values())
+    for (l0, h0), (l1, h1) in zip(envs, envs[1:]):
+        ov = min(h0, h1) - max(l0, l1)
+        if ov > 0.25 * max(1.0, min(h0 - l0, h1 - l1)):
+            return "col-envelope-overlap"
+    for l0, h0 in envs:
+        if 0 < h0 - l0 <= 1.5 * med:
+            if not any(l0 - 0.5 <= (c[0] + c[2]) / 2 <= h0 + 0.5
+                       for c in all_chars):
+                return "phantom-narrow-empty-col"
+    lines: dict = {}
+    for c in all_chars:
+        key = round(c[5], 1)
+        lo, hi = lines.get(key, (c[1], c[3]))
+        lines[key] = (min(lo, c[1]), max(hi, c[3]))
+    if lines:
+        y_edges = [e for r in valid for e in (r[1], r[3])
+                   if by0 + 2 < e < by1 - 2]
+        cut = sum(1 for y0, y1 in lines.values()
+                  if any(y0 + 1.0 < e < y1 - 1.0 for e in y_edges))
+        if cut >= max(3, int(0.15 * len(lines))):
+            return "row-edge-cuts-lines"
+    return None
+
+
+def _ruled_grid_repair(page: fitz.Page,
+                       table_bbox: Tuple[float, float, float, float],
+                       cell_meta: List, cell_rects: List,
+                       all_chars: List,
+                       ) -> Optional[Tuple[List, List, int, int]]:
+    """矢量线网格重建：劣性 SLANet 网格 + 完整矢量线网格 → 新
+    (cell_rects, cell_meta, num_rows, num_cols)；任一条件不满足返回
+    None 保持基线。"""
+    if not all_chars or not cell_rects:
+        return None
+    bx0, by0, bx1, by1 = table_bbox
+    bw, bh = bx1 - bx0, by1 - by0
+    if bw < 10 or bh < 10:
+        return None
+    med = _median_char_size(all_chars)
+    reason = _slanet_grid_pathology(cell_meta, cell_rects, all_chars,
+                                    med, table_bbox)
+    if reason is None:
+        return None
+
+    H, V = _ruled_line_segments(page, table_bbox)
+    # 行边：合并后的横线覆盖 ≥0.5×bbox 宽才算行线
+    h_edges = []
+    for pos, lo, hi in _merge_axis_positions(H):
+        cov = min(hi, bx1) - max(lo, bx0)
+        if cov >= 0.5 * bw:
+            h_edges.append(pos)
+    h_edges.sort()
+    if len(h_edges) < 2:
+        return None
+    # 列边：全高（≥0.75×bbox 高）为全局列边；短于全高但 ≥max(4pt,
+    # 1.5×字号) 的为局部列边（如信息表仅首行存在的竖线），逐行按
+    # 覆盖 ≥0.9×行高采纳
+    v_full: List = []
+    v_part: List = []
+    for pos, lo, hi in _merge_axis_positions(V):
+        lo2, hi2 = max(lo, by0), min(hi, by1)
+        if hi2 - lo2 >= 0.75 * bh:
+            v_full.append(pos)
+        elif hi2 - lo2 >= max(4.0, 1.5 * med):
+            v_part.append((pos, lo2, hi2))
+    if len(v_full) < 3:
+        return None
+    row_iv = [(a, b) for a, b in zip(h_edges, h_edges[1:])
+              if b - a >= 4.0]
+    if not row_iv:
+        return None
+    # 行线必须结构化文本带：≥0.8 的字形行完整落在某个行线区间内
+    lines: dict = {}
+    for c in all_chars:
+        key = round(c[5], 1)
+        lo, hi = lines.get(key, (c[1], c[3]))
+        lines[key] = (min(lo, c[1]), max(hi, c[3]))
+    if not lines:
+        return None
+    n_cov = sum(1 for y0, y1 in lines.values()
+                if any(a - 1.0 <= y0 and y1 <= b + 1.0
+                       for a, b in row_iv))
+    if n_cov < 0.8 * len(lines):
+        return None
+
+    new_rects: List = []
+    new_meta: List = []
+    n_rows = len(row_iv)
+    n_cols = 0
+    for ri, (a, b) in enumerate(row_iv):
+        xs = list(v_full)
+        for pos, lo, hi in v_part:
+            cov = min(hi, b) - max(lo, a)
+            if cov >= 0.9 * (b - a):
+                xs.append(pos)
+        xs.sort()
+        merged: List = []
+        for x in xs:
+            if merged and x - merged[-1] <= 1.5:
+                continue
+            merged.append(x)
+        n_cols = max(n_cols, len(merged) - 1)
+        for ci in range(len(merged) - 1):
+            r = (merged[ci], a, merged[ci + 1], b)
+            if r[2] - r[0] < 1.0:
+                continue
+            new_rects.append(r)
+            new_meta.append((ri, ri, ci, ci, r))
+    if not new_rects or n_cols < 2:
+        return None
+
+    # 守卫：矢量列边切穿文本 span 的数量不得高于 SLANet 网格（跨列
+    # 合并表头的均匀化会切字、被此守卫拦下保持 SLANet 结构）
+    from assay.completion import _split_violations
+    from assay.splitting import _rows as _region_rows
+    bands = _region_rows(page, fitz.Rect(*table_bbox))
+    if bands:
+        my_edges = sorted({v for r in new_rects for v in (r[0], r[2])})
+        sl_edges = sorted({v for r in cell_rects
+                            if r[2] > r[0] for v in (r[0], r[2])})
+        if _split_violations(bands, my_edges) >                 _split_violations(bands, sl_edges):
+            return None
+    # 守卫G_row（行数塌缩）：仅当 SLANet 行数与文本带数对齐（其
+    # 行结构此时可信）而矢量行数显著更少时，判定矢量线只有外框/极
+    # 少数行线，重建会把多行塌缩成巨格；SLANet 行与文本带数失配
+    # （互绞/幻影行）时其行数不构成证据，放行
+    n_bands = len(bands)
+    slanet_rows_n = len({m[0] for m in cell_meta}) or 1
+    if (n_bands and abs(slanet_rows_n - n_bands) <= 0.25 * n_bands
+            and n_rows * 100 < 85 * slanet_rows_n):
+        return None
+    # 守卫G_lat（区间内隐子表）：某行区间含 ≥3 条文本带且带间空隙
+    # 中点聚出 ≥2 个高支持度、不被该行矢量列边解释的列界，说明区
+    # 间内部存在未被矢量线刻画的子网格（无内线数据表），重建必错
+    if bands and med:
+        iv_bands: dict = {}
+        for b3 in bands:
+            cy = (b3[0] + b3[1]) / 2
+            for (a, b4) in row_iv:
+                if a - 1 <= cy <= b4 + 1:
+                    iv_bands.setdefault((a, b4), []).append(b3)
+                    break
+        for (a, b4), bl in iv_bands.items():
+            if len(bl) < 3:
+                continue
+            r_edges = sorted({v for r in new_rects
+                              if r[1] == a and r[3] == b4
+                              for v in (r[0], r[2])})
+            gm: List = []
+            for (_y0, _y1, spans) in bl:
+                ss = sorted(spans)
+                for p, q in zip(ss, ss[1:]):
+                    if q[0] - p[1] >= max(3.0, 0.5 * med):
+                        gm.append((p[1] + q[0]) / 2.0)
+            if len(gm) < 2:
+                continue
+            gm.sort()
+            gcl = [[gm[0]]]
+            for m in gm[1:]:
+                if m - gcl[-1][-1] <= 3.0:
+                    gcl[-1].append(m)
+                else:
+                    gcl.append([m])
+            strong = 0
+            for cl in gcl:
+                cen = sum(cl) / len(cl)
+                if (len(cl) >= 0.6 * len(bl)
+                        and not any(abs(cen - e) <= 3.0 for e in r_edges)):
+                    strong += 1
+            if strong >= 2:
+                return None
+    # 守卫R2（矢量漏列）：多 span 行的宽空隙中点若聚成高支持度列界
+    # 且不被任何矢量列边解释，说明存在无内线的真实列界被矢量网格
+    # 漏掉——此时保持基线，交由 complete_table 的文本候选处理
+    # 守卫G_cover（覆盖）：矢量网格必须覆盖表内文本主体——网格外的
+    # 大块文本（无线首末列、表头整带）会在归属阶段溢出成标题/散文本，
+    # 说明矢量线只覆盖了表的一部分，不是全表网格
+    if new_rects:
+        gx0 = min(r[0] for r in new_rects)
+        gx1 = max(r[2] for r in new_rects)
+        gy0 = min(r[1] for r in new_rects)
+        gy1 = max(r[3] for r in new_rects)
+        xtol = max(8.0, 1.5 * med)
+        in_box = [c for c in all_chars
+                  if bx0 <= (c[0] + c[2]) / 2 <= bx1
+                  and by0 <= (c[1] + c[3]) / 2 <= by1]
+        if not in_box:
+            in_box = list(all_chars)
+        n_x = sum(1 for c in in_box
+                  if c[0] < gx0 - xtol or c[2] > gx1 + xtol)
+        if len(in_box) >= 3 and n_x >= 3 and n_x >= 0.02 * len(in_box):
+            return None
+        n_y = sum(1 for c in in_box
+                  if not (gy0 - 1.0 <= (c[1] + c[3]) / 2 <= gy1 + 1.0))
+        if n_y > 0.15 * len(in_box):
+            return None
+    if bands and med:
+        col_all = sorted({v for r in new_rects for v in (r[0], r[2])})
+        gap_thr = max(4.0, 1.0 * med)
+        mids: List = []
+        n_gap = 0
+        for (y0, y1, _spans) in bands:
+            cs = sorted((c for c in all_chars
+                         if y0 - 1.0 <= (c[1] + c[3]) / 2 <= y1 + 1.0),
+                        key=lambda c: c[0])
+            hit = False
+            for a, b2 in zip(cs, cs[1:]):
+                if b2[0] - a[2] >= gap_thr:
+                    mids.append((a[2] + b2[0]) / 2.0)
+                    hit = True
+            if hit:
+                n_gap += 1
+        if n_gap >= 3 and len(mids) >= 3:
+            mids.sort()
+            cls = [[mids[0]]]
+            for m in mids[1:]:
+                if m - cls[-1][-1] <= 3.0:
+                    cls[-1].append(m)
+                else:
+                    cls.append([m])
+            for cl in cls:
+                cen = sum(cl) / len(cl)
+                if (len(cl) >= 3 and len(cl) >= 0.4 * n_gap
+                        and not any(abs(cen - e) <= 3.0 for e in col_all)):
+                    return None
+    return new_rects, new_meta, n_rows, n_cols, reason
+
+
 def build_table_from_slanet(
     slanet_result: Dict,
     page: fitz.Page,
@@ -1259,6 +1590,22 @@ def build_table_from_slanet(
                     ix1 * scale_x, iy1 * scale_y)
         cell_meta.append((start_row, end_row, start_col, end_col, pdf_bbox))
         cell_rects.append(pdf_bbox)
+
+    # C5 矢量线网格修复：劣性 SLANet 布局 + 完整矢量线网格时，用矢量
+    # 线行列边替换 cell_rects/cell_meta，字形归属（下方三级归属 + 行
+    # 原子化 + 数值归位）按替换后的网格执行
+    ruled_repair = False
+    if table_bbox is not None:
+        rep = _ruled_grid_repair(page, table_bbox, cell_meta, cell_rects,
+                                 all_chars)
+        if rep is not None:
+            cell_rects, cell_meta, num_rows, num_cols, _why = rep
+            n_cells = len(cell_rects)
+            ruled_repair = True
+            _log.info(f"p{page_idx + 1} C5 ruled-grid repair ({_why}): "
+                      f"vector grid {num_rows}x{num_cols} replaces SLANet "
+                      f"layout "
+                      f"(bbox={tuple(round(v, 1) for v in table_bbox)})")
 
     # 列包络：同列所有格的 x 并集。右对齐列的表头格居中而数据值右探，
     # SLANet 表头格右界普遍比列的真实右界窄（"2023 年 12 月 31 日"
@@ -1379,13 +1726,18 @@ def build_table_from_slanet(
             col_span=col_span,
         ))
 
-    return TableOutput(
+    table_out = TableOutput(
         page_no=page_idx,
         num_rows=num_rows,
         num_cols=num_cols,
         cells=table_cells,
         table_bbox=table_bbox or (0, 0, 0, 0),
     )
+    if ruled_repair:
+        # C5：主流程据此跳过 complete_table（该表的行/列边已是矢量线
+        # 事实，straddle 触发器会把合法高折行行误判成行漂移）
+        table_out.ruled_grid = True
+    return table_out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1593,9 +1945,24 @@ class AssayExtractor:
                         # an under-segmented SLANet grid with a geometric
                         # rebuild (never adds/removes tables — see
                         # assay.completion for its self-checks).
-                        new_cells, nnr, nnc, done = complete_table(
-                            page, table_bbox, table_out.cells,
-                            table_out.num_rows, table_out.num_cols)
+                        if getattr(table_out, "ruled_grid", False):
+                            # C5 矢量线网格修复过的表：行列边已是矢量线
+                            # 事实，complete_table 的结构触发器会把合法
+                            # 高折行行误判成行漂移而拆毁正确网格，仅保留
+                            # 幂等文本修复；done=False 使下方 done 分支
+                            # 全部跳过
+                            try:
+                                from assay.completion import (
+                                    _apply_text_repairs)
+                                table_out.cells = _apply_text_repairs(
+                                    table_out.cells)
+                            except ImportError:
+                                pass
+                            done = False
+                        else:
+                            new_cells, nnr, nnc, done = complete_table(
+                                page, table_bbox, table_out.cells,
+                                table_out.num_rows, table_out.num_cols)
                         # C3 重建坍缩拒收：几何重建把多列表压成少数粗
                         # 列、而区域行 x 起点簇数表明真实列数远多于此
                         # （诚志 p63：7 列承诺表压成 2 列，600 字正文与
