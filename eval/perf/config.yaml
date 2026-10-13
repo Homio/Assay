@@ -13,8 +13,8 @@ paths:
   pdf_root: /home/homio/sda/1111/original
   baseline_runs_dir: /home/homio/sda/1111/Assay/eval/runs
   analysis_root: /home/homio/sda/1111/analysis/perf
-  track_root: /home/homio/sda/1111/analysis/perf/track_p4
-  track_label: track_p4
+  track_root: /home/homio/sda/1111/analysis/perf/track_p5
+  track_label: track_p5
 
 # ── GPU policy ───────────────────────────────────────────────────────────
 # 家里机双卡：GPU0 = 96GB 跑 Assay；GPU1 = 16GB 跑语皇，**绝对不许碰**。

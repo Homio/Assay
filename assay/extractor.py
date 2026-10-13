@@ -1752,6 +1752,8 @@ def prepare_page_slanet_data(
     gate_fn,
     structure_fn,
     batch_size: int = GPU_BATCH_SIZE,
+    fused_cslanet_fn=None,
+    gate_threshold: float = None,
 ) -> List[Tuple[Dict, Tuple[float, float, float, float]]]:
     """Phase-2 body for ONE table-candidate page (track_p3b stage 3).
 
@@ -1769,6 +1771,21 @@ def prepare_page_slanet_data(
         yolo_tables:     detection boxes in PDF points from detect_tables_on_page.
         gate_fn:         crop_img -> bool (gatekeeper threshold baked in by caller).
         structure_fn:    crop_specs -> List[Dict] (TableModel.process_crops contract).
+        fused_cslanet_fn: track_p5 optional fused GPU roundtrip:
+                         (crop_imgs, offsets) -> List[Dict] with keys
+                         'prob' (PP-LCNet gate probability), plus the
+                         standard SLANet result keys ('cell_bboxes',
+                         'logic_points', 'offset', 'img_size') of EVERY
+                         crop, all in one request.  When provided,
+                         gate_fn/structure_fn are not called; the gate
+                         decision is applied locally against
+                         ``gate_threshold`` (same >= comparison the legacy
+                         gate_fn performs on the very same probability),
+                         and gate-failing crops are dropped from the pairs
+                         exactly as before.  SLANet on an eventually
+                         gated-out crop is computed but discarded — the
+                         observable output is identical.
+        gate_threshold:  gate probability floor for the fused path.
 
     Returns:
         [(slanet_result, table_bbox), ...] in detection order.
@@ -1788,14 +1805,12 @@ def prepare_page_slanet_data(
         _pix_arr = np.repeat(_pix_arr, 3, axis=2)
     full_img = _Image.fromarray(_pix_arr)
 
-    page_crops: List[Dict] = []
-    page_meta: List[Dict] = []
-
-    for (pdf_x0, pdf_y0, pdf_x1, pdf_y1, conf) in yolo_tables:
+    def _crop_one(yolo_t):
         # The detection bbox is already tight (ruling-line snap or
         # text shrink).  Pad only a few points so SLANet sees the
         # full glyphs sitting on the border lines — never the old
         # greedy expansion that swallowed headers / body text.
+        (pdf_x0, pdf_y0, pdf_x1, pdf_y1, _conf) = yolo_t
         orig_bbox = (pdf_x0, pdf_y0, pdf_x1, pdf_y1)
         sub_x0, sub_y0, sub_x1, sub_y1 = _expand_bbox(
             orig_bbox, pad_top=4.0, pad_bottom=4.0,
@@ -1809,9 +1824,50 @@ def prepare_page_slanet_data(
         img_y1 = min(pix.height, int(sub_y1 / scale_y))
 
         if img_x1 <= img_x0 or img_y1 <= img_y0:
-            continue
-
+            return None
         crop_img = full_img.crop((img_x0, img_y0, img_x1, img_y1))
+        return crop_img, (img_x0, img_y0), orig_bbox
+
+    # ── track_p5 fused path: ONE GPU roundtrip for gate + structure ──
+    # The server runs the PP-LCNet gate and SLANet on every crop of the
+    # request in parallel and returns per-crop (prob, slanet_result);
+    # the gate comparison below is the same >= the legacy gate_fn applies
+    # on the very same probability, so observable pairs are identical.
+    if fused_cslanet_fn is not None:
+        crop_imgs: List = []
+        offsets: List[Tuple[int, int]] = []
+        bboxes: List[Tuple[float, float, float, float]] = []
+        for t in yolo_tables:
+            r = _crop_one(t)
+            if r is None:
+                continue
+            crop_imgs.append(r[0])
+            offsets.append(r[1])
+            bboxes.append(r[2])
+        if not crop_imgs:
+            return []
+        fused = fused_cslanet_fn(crop_imgs, offsets)
+        pairs: List[Tuple[Dict, Tuple[float, float, float, float]]] = []
+        for i, fres in enumerate(fused):
+            # fres: {'prob', 'cell_bboxes', 'logic_points', 'offset',
+            #         'img_size'} —— 与 legacy slanet 回包同键 + prob。
+            # 门控比较与 legacy gate_fn 完全同一 >=，同一概率值。
+            if fres["prob"] < gate_threshold:
+                continue
+            # 剥掉 prob：sres 与 legacy structure_fn 回包逐键一致。
+            sres = {k: fres[k] for k in
+                    ("cell_bboxes", "logic_points", "offset", "img_size")}
+            pairs.append((sres, bboxes[i]))
+        return pairs
+
+    page_crops: List[Dict] = []
+    page_meta: List[Dict] = []
+
+    for yolo_t in yolo_tables:
+        r = _crop_one(yolo_t)
+        if r is None:
+            continue
+        crop_img, offset, orig_bbox = r
 
         # Step 4: PP-LCNet gatekeeper
         if not gate_fn(crop_img):
@@ -1819,7 +1875,7 @@ def prepare_page_slanet_data(
 
         page_crops.append({
             'image': crop_img,
-            'offset': (img_x0, img_y0),
+            'offset': offset,
         })
         page_meta.append({
             'page_idx': page.number,

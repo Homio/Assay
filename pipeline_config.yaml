@@ -24,8 +24,31 @@ gpu_server:
   cls_window_ms: 3           # cls 单图 ~0.18ms，窗口只为聚合并发请求
   slanet_window_ms: 5        # slanet 跨页聚合凑批（engine batch_size 真批）
   slow_batch_ms: 2000        # 单批超过该耗时打 WARN 日志
+  # ── track_p5：合并调用通道（detect 任务 GPU 往返 5 跳 → 2 跳）────────
+  # 总开关：false 时 worker 走 P3b 三通道路径，逐位不变（legacy 回退）。
+  fused_calls: false
+  # yolo2：一次往返携带 std + 条件 fb 双 pass。跨请求同 conf 合批
+  # （ultralytics list source）经 2026-10-13 A/B 实测与逐页 predict
+  # 存在像素级漂移（x 坐标 ~0.5-2.5px、conf ~0.004，根因：batch 统一
+  # letterbox pad vs 单图 rect 最小 pad），超出 fp 抖动豁免范畴，
+  # 故默认回退 false = 逐请求 predict，与旧调用序列逐次一致
+  # （A/B 见 track_p5/ab_yolo_listbatch.py / ab_yolo.log）。
+  yolo_list_batch: false
+  yolo2_drain_max: 16        # YOLO GPU-bound平坦，大批量摊调用固定成本
+  # cslanet：整批 crop 一次往返完成门控 + SLANet（服务端
+  # 两路并行）；预处理/解码用线程池并行以提升
+  # GPU 排队深度（CPU 解压）。
+  cslanet_batch_max: 48      # slanet session 实测批48最优(2.83ms/crop，bench_slanet_fn_result)
+  cslanet_prep_threads: 2    # 服务端 cls/slanet 预处理与解码线程池大小
+  yolo2_window_ms: 25        # 与 yolo 同理：到即执行
+  yolo2_pred_threads: 2      # std/fb 双组 predict 并行度（1=串行回退）
+  cslanet_window_ms: 350     # track_p5: 凑满48窗口（到达率~40crops/s时批~35-48）
+  exec_debug: false           # track_p5: 通道执行分解计时（诊断开关，默认 false）
+  split_servers: false       # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
 
 scheduler:
+  worker_lanes: 4            # track_p5：每 worker 进程内车道数（1=P3b 单车道回退）
+  worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）
   calib_chunk_pages: 32      # 页眉校准扫描分片大小（页/任务）
   a_floor_fraction: 0.25     # A 类（文本）在制保底占比（×worker 数）
   max_task_retries: 2        # 单任务失败重投上限（GPU 超时/瞬时错误）

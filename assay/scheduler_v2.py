@@ -525,6 +525,9 @@ class SchedulerV2:
         from assay.worker_v2 import worker_main
         worker_cfg = {
             "gpu_timeout_s": self.gpu_timeout_s,
+            # track_p5：合并调用开关（gpu_server.fused_calls，默认
+            # true；false = P3b 三通道路径逐位不变）。
+            "fused_calls": bool(self.gpu_cfg.get("fused_calls", True)),
         }
         workers = []
         for i in range(self.num_workers):

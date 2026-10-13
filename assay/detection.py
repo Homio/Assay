@@ -881,6 +881,7 @@ def detect_tables_on_page(
     pix: fitz.Pixmap = None,
     zoom: float = PAGE_ZOOM,
     yolo_fn=None,
+    yolo_fused_fn=None,
 ):
     """
     Full detection pipeline for a single PDF page.
@@ -892,8 +893,21 @@ def detect_tables_on_page(
     service while keeping every geometric step identical.  It must accept
     the same (pix, conf=...) contract as detect_tables_image; the default
     (None) keeps the legacy in-process behaviour — zero behaviour change.
+
+    track_p5: ``yolo_fused_fn`` (mutually exclusive with yolo_fn) merges
+    the standard pass and the conditional low-confidence fallback pass
+    into ONE GPU roundtrip.  Contract:
+        yolo_fused_fn(pix, need_fallback: bool)
+            -> (raw_std, raw_fb_or_None)
+    where raw_std is exactly what ``yolo_fn(pix)`` returns and raw_fb
+    (returned only when need_fallback is True) is exactly what
+    ``yolo_fn(pix, conf=YOLO_CONFIDENCE_FALLBACK)`` returns.  The
+    heuristic that decides need_fallback is computed here BEFORE the
+    call (it does not depend on the YOLO result), so the fused variant
+    performs the identical two predict passes — just over a single
+    request.  Legacy path (both params None) is byte-for-byte unchanged.
     """
-    if yolo_fn is None:
+    if yolo_fn is None and yolo_fused_fn is None:
         yolo_fn = detect_tables_image
     if pix is None:
         mat = fitz.Matrix(zoom, zoom)
@@ -902,7 +916,7 @@ def detect_tables_on_page(
     # ── Vector ruling rectangles (independent, high-precision candidates) ──
     ruling_rects, H, V = detect_ruling_rects(page)
 
-    # ── YOLO detect — dual-pass when the page looks like a table ──
+    # ── Page heuristic: does the fallback pass look worth it? ──
     text = page.get_text("text")
     total_chars = len(text)
     if total_chars > 0:
@@ -918,7 +932,16 @@ def detect_tables_on_page(
         # signal that the low-confidence fallback pass is worth running.
         heuristic_table = looks_text_table(page, tuple(page.rect))
 
-    raw = yolo_fn(pix)  # standard confidence pass
+    # ── YOLO detect — dual-pass when the page looks like a table ──
+    # track_p5: fused variant carries both passes in one roundtrip.  The
+    # fallback raw boxes are handed back together with the standard pass;
+    # every downstream step (mapping, NMS ordering, fallback dedup) is
+    # identical to the legacy two-call sequence.
+    raw_fb = None
+    if yolo_fused_fn is not None:
+        raw, raw_fb = yolo_fused_fn(pix, heuristic_table)
+    else:
+        raw = yolo_fn(pix)  # standard confidence pass
 
     # Map → PDF and merge the standard pass FIRST.  The fallback dedup below
     # must run against the NMS *survivors*: a low-confidence page-spanning
@@ -935,7 +958,8 @@ def detect_tables_on_page(
         pdf_tables = merge_overlapping(pdf_tables)
 
     if heuristic_table:
-        raw_fb = yolo_fn(pix, conf=YOLO_CONFIDENCE_FALLBACK)
+        if raw_fb is None:
+            raw_fb = yolo_fn(pix, conf=YOLO_CONFIDENCE_FALLBACK)
         if raw_fb:
             fb_pdf = image_to_pdf(
                 raw_fb,

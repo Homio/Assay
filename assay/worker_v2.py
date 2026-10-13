@@ -70,28 +70,48 @@ def run_text(task):
             "cand": bool(cand)}
 
 
-def run_detect(task, client):
+def run_detect(task, client, fused_calls=False):
     import fitz
     import numpy as np
-    from assay.detection import (detect_tables_on_page, YOLO_CONFIDENCE)
+    from assay.detection import (
+        detect_tables_on_page, YOLO_CONFIDENCE, YOLO_CONFIDENCE_FALLBACK)
     from assay.extractor import (PAGE_ZOOM, GATEKEEPER_THRESHOLD,
                                  prepare_page_slanet_data)
     doc = _open_doc(task["path"])
     page = doc[task["page_idx"]]
     pix = page.get_pixmap(matrix=fitz.Matrix(PAGE_ZOOM, PAGE_ZOOM))
 
-    # yolo_fn 与 detection.detect_tables_image 同契约（pix, conf=…），
-    # 采样通道裁剪与 detect_tables_image 逐行一致；内部走 GPU 服务。
-    def _yolo_fn(pix, conf=YOLO_CONFIDENCE):
+    def _pix_arr(pix):
+        # 采样通道裁剪与 detect_tables_image 逐行一致。
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
             pix.height, pix.width, pix.n)
         if arr.shape[2] > 3:
             arr = arr[:, :, :3]
         elif arr.shape[2] == 1:
             arr = np.repeat(arr, 3, axis=2)
-        return client.yolo_detect(arr, conf)
+        return arr
 
-    yolo_tables = detect_tables_on_page(page, pix, PAGE_ZOOM, yolo_fn=_yolo_fn)
+    if fused_calls:
+        # track_p5：detect 任务 GPU 往返 5 跳 → 2 跳。
+        # 第 1 跳：std + 条件 fb 双 pass 一次请求（fb 仅在 heuristic
+        # 判真时随行携带，服务端可选同 conf 跨请求合批）。
+        def _yolo_fused_fn(pix, need_fallback):
+            return client.yolo2_detect(
+                _pix_arr(pix), YOLO_CONFIDENCE,
+                conf_fb=(YOLO_CONFIDENCE_FALLBACK if need_fallback
+                         else None))
+
+        yolo_tables = detect_tables_on_page(
+            page, pix, PAGE_ZOOM, yolo_fused_fn=_yolo_fused_fn)
+    else:
+        # yolo_fn 与 detection.detect_tables_image 同契约（pix, conf=…），
+        # 采样通道裁剪与 detect_tables_image 逐行一致；内部走 GPU 服务。
+        def _yolo_fn(pix, conf=YOLO_CONFIDENCE):
+            return client.yolo_detect(_pix_arr(pix), conf)
+
+        yolo_tables = detect_tables_on_page(
+            page, pix, PAGE_ZOOM, yolo_fn=_yolo_fn)
+
     # image-pixel → PDF-point 换算（与 legacy extract() Phase 2 同口径）
     scale_x = page.rect.width / pix.width
     scale_y = page.rect.height / pix.height
@@ -104,12 +124,25 @@ def run_detect(task, client):
         # 服务端返回逐图 P(table)，worker 端做同一比较。
         return client.classify([crop_img])[0] >= GATEKEEPER_THRESHOLD
 
-    # 单请求整页发派：服务端跨页合并凑批（batch_size 由服务端配置）。
-    pairs = prepare_page_slanet_data(
-        page, pix, yolo_tables, gate_fn=_gate,
-        structure_fn=client.process_crops,
-        batch_size=max(1, len(yolo_tables)),
-    )
+    if fused_calls:
+        # 第 2 跳：整页全部 crop 的门控 + SLANet 结构一次请求。
+        # 服务端 cls 与 slanet 并行执行；门控判定在本端用同一阈值
+        # 比较（fused 路径下 gate_fn/structure_fn 不被调用，仅保
+        # legacy 可回退）。
+        pairs = prepare_page_slanet_data(
+            page, pix, yolo_tables, gate_fn=_gate,
+            structure_fn=client.process_crops,
+            batch_size=max(1, len(yolo_tables)),
+            fused_cslanet_fn=client.cslanet_all,
+            gate_threshold=GATEKEEPER_THRESHOLD,
+        )
+    else:
+        # 单请求整页发派：服务端跨页合并凑批（batch_size 由服务端配置）。
+        pairs = prepare_page_slanet_data(
+            page, pix, yolo_tables, gate_fn=_gate,
+            structure_fn=client.process_crops,
+            batch_size=max(1, len(yolo_tables)),
+        )
     return {"pairs": pairs, "n_crops": len(pairs),
             "scale_x": scale_x, "scale_y": scale_y}
 
@@ -145,6 +178,10 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
 
     logging.basicConfig(level=logging.WARNING)
     timeout_s = float(cfg.get("gpu_timeout_s", 60.0))
+    # track_p5：合并调用开关（scheduler worker_cfg 透传，源自
+    # pipeline_config.yaml gpu_server.fused_calls）。false = P3b 三通道
+    # 路径，逐位不变。
+    fused_calls = bool(cfg.get("fused_calls", False))
     client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s)
 
     while True:
@@ -167,7 +204,7 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
             elif kind == "text":
                 out = run_text(task)
             elif kind == "detect":
-                out = run_detect(task, client)
+                out = run_detect(task, client, fused_calls=fused_calls)
             elif kind == "build":
                 out = run_build(task)
             else:
