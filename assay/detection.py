@@ -152,21 +152,35 @@ def detect_tables_image(
 
     tables = []
     for result in results:
-        boxes = result.boxes
-        if boxes is None:
-            continue
-        for box in boxes:
-            cls_name = result.names[int(box.cls[0])].lower()
-            # Accept only exact 'table' class — exclude 'table_caption',
-            # 'table_footnote' which are sub-elements, not full tables
-            if cls_name != 'table':
-                continue
-            img_box = box.xyxy[0].tolist()
-            score = float(box.conf[0])
-            tables.append((
-                img_box[0], img_box[1], img_box[2], img_box[3], score
-            ))
+        tables.extend(_extract_yolo_tables(result))
+    return tables
 
+
+def _extract_yolo_tables(result) -> List[Tuple[float, float, float, float, float]]:
+    """Parse ONE ultralytics predict result into 'table'-class boxes.
+
+    track_p3b stage 3: pure code motion out of ``detect_tables_image`` —
+    the identical parsing loop, factored so the resident GPU inference
+    service can run YOLO predict on a worker-supplied page array and reuse
+    exactly this post-processing.  Class filter ('table' only, excluding
+    table_caption/table_footnote), xyxy order, float conf — algorithm
+    unchanged.
+    """
+    tables = []
+    boxes = result.boxes
+    if boxes is None:
+        return tables
+    for box in boxes:
+        cls_name = result.names[int(box.cls[0])].lower()
+        # Accept only exact 'table' class — exclude 'table_caption',
+        # 'table_footnote' which are sub-elements, not full tables
+        if cls_name != 'table':
+            continue
+        img_box = box.xyxy[0].tolist()
+        score = float(box.conf[0])
+        tables.append((
+            img_box[0], img_box[1], img_box[2], img_box[3], score
+        ))
     return tables
 
 
@@ -505,80 +519,96 @@ def statement_caption_info(stem: str) -> dict:
     return {}
 
 
-def calibrate_page_headers(doc) -> set:
+def calibrate_page_headers_scan_page(page) -> dict:
     """
-    Learn this document's running-header line signatures.
+    Per-page scan body of calibrate_page_headers (track_p3b stage 3 split).
 
-    A running header is a document-level invariant: the same text (modulo
-    page numbers) printed at the same y in the top page band on a large
-    share of pages.  No genuine table row can repeat at one fixed y across
-    that many pages, so a signature qualifying here is never table content.
-    Signatures are keyed with a quantised y so a repeated column-header of
-    a long continuation table (whose y floats with content) cannot qualify,
-    while a book that moves its header between sections (平安, 中石油) yields
-    one qualifying key per placement.  Returns a set of signature strings;
-    empty set = headerless document, trim disabled (fail-open to the
-    current behaviour — a missed trim never breaks anything).
-
-    Side effect (C2/C6): the same single pass also collects statement-name
-    caption lines and stripped 附注 header lines into _stmt_cap_cache for the
-    output layer — see statement_caption_info.
+    Returns a picklable partial dict with the exact per-page state the
+    original in-loop body produced:
+      {'page_no', 'seen', 'cap_page', 'cap_session', 'notes_cand', 'plines'}
+    The book-level merge (counts / cap_pages / cap_sessions / notes_cand /
+    plines) plus the floor filter, Class-B 附注 pass and caption-context
+    construction live in register_header_calibration — identical logic,
+    just executed after the partials are (possibly concurrently) gathered.
     """
-    key = (doc.name, len(doc))
+    seen = set()
+    top_stmt = None
+    last_stmt = None
+    page_lines = []
+    notes_entry = None
+    ph = page.rect.height
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            txt = "".join(s["text"] for s in line["spans"]).strip()
+            sig = _hdr_sig(txt)
+            if txt:
+                page_lines.append((lx0, ly0, lx1, ly1, txt, sig))
+            if _STMT_NAME_RE.match(sig):
+                canon = _stmt_canon(sig)
+                entry = {
+                    "kind": "statement",
+                    "name": canon,
+                    "text": txt,
+                    "bbox": (lx0, ly0, lx1, ly1),
+                    "printed_continued": "续" in sig and sig != canon,
+                }
+                if ly0 < CAPTION_TOP_FRAC * ph and top_stmt is None:
+                    top_stmt = entry
+                last_stmt = entry
+            if ly0 >= HDR_BAND:
+                continue
+            if len(sig) >= 4:
+                seen.add((sig, round(ly0 / 3.0)))
+                if "附注" in sig and notes_entry is None:
+                    notes_entry = {
+                        "kind": "notes",
+                        "name": sig,
+                        "text": txt,
+                        "bbox": (lx0, ly0, lx1, ly1),
+                    }
+    return {
+        "page_no": page.number,
+        "seen": sorted(seen),
+        "cap_page": top_stmt,
+        "cap_session": last_stmt,
+        "notes_cand": notes_entry,
+        "plines": page_lines if (top_stmt is not None
+                                 or notes_entry is not None) else None,
+    }
+
+
+def register_header_calibration(doc_name, n_pages, partials) -> set:
+    """
+    Merge per-page calibration partials (ascending page order) and populate
+    _hdr_sig_cache / _stmt_cap_cache exactly like the original single-pass
+    calibrate_page_headers — the floor filter, Class-B 附注 header pass and
+    caption-context construction are copied verbatim.  Called by the
+    scheduler process so the export-side statement_caption_info keeps
+    working under the v2 page-granular pipeline.
+    """
+    key = (doc_name, n_pages)
     if key in _hdr_sig_cache:
         return _hdr_sig_cache[key]
 
     counts: dict = {}
-    cap_pages: dict = {}      # page_no -> top-band caption entry (Class A/B)
-    cap_sessions: dict = {}   # page_no -> last statement-name entry on page
-    notes_cand: dict = {}     # page_no -> 附注 header candidate (pre-filter)
-    plines: dict = {}         # page_no -> raw lines (caption pages only)
-    for page in doc:
-        seen = set()
-        top_stmt = None
-        last_stmt = None
-        page_lines = []
-        ph = page.rect.height
-        for block in page.get_text("dict")["blocks"]:
-            for line in block.get("lines", []):
-                lx0, ly0, lx1, ly1 = line["bbox"]
-                txt = "".join(s["text"] for s in line["spans"]).strip()
-                sig = _hdr_sig(txt)
-                if txt:
-                    page_lines.append((lx0, ly0, lx1, ly1, txt, sig))
-                if _STMT_NAME_RE.match(sig):
-                    canon = _stmt_canon(sig)
-                    entry = {
-                        "kind": "statement",
-                        "name": canon,
-                        "text": txt,
-                        "bbox": (lx0, ly0, lx1, ly1),
-                        "printed_continued": "续" in sig and sig != canon,
-                    }
-                    if ly0 < CAPTION_TOP_FRAC * ph and top_stmt is None:
-                        top_stmt = entry
-                    last_stmt = entry
-                if ly0 >= HDR_BAND:
-                    continue
-                if len(sig) >= 4:
-                    seen.add((sig, round(ly0 / 3.0)))
-                    if "附注" in sig and page.number not in notes_cand:
-                        notes_cand[page.number] = {
-                            "kind": "notes",
-                            "name": sig,
-                            "text": txt,
-                            "bbox": (lx0, ly0, lx1, ly1),
-                        }
-        for k in seen:
+    cap_pages: dict = {}
+    cap_sessions: dict = {}
+    notes_cand: dict = {}
+    plines: dict = {}
+    for part in sorted(partials, key=lambda p: p["page_no"]):
+        for k in part["seen"]:
             counts[k] = counts.get(k, 0) + 1
-        if top_stmt is not None:
-            cap_pages[page.number] = top_stmt
-        if last_stmt is not None:
-            cap_sessions[page.number] = last_stmt
-        if top_stmt is not None or page.number in notes_cand:
-            plines[page.number] = page_lines
+        if part["cap_page"] is not None:
+            cap_pages[part["page_no"]] = part["cap_page"]
+        if part["cap_session"] is not None:
+            cap_sessions[part["page_no"]] = part["cap_session"]
+        if part["notes_cand"] is not None:
+            notes_cand[part["page_no"]] = part["notes_cand"]
+        if part["plines"] is not None:
+            plines[part["page_no"]] = part["plines"]
 
-    floor = max(HDR_MIN_PAGES, HDR_MIN_FRAC * len(doc))
+    floor = max(HDR_MIN_PAGES, HDR_MIN_FRAC * n_pages)
     sigs = {sig for (sig, _), n in counts.items() if n >= floor}
     # Class B 附注页眉: only a signature the running-header consensus actually
     # strips is a lost caption worth re-emitting; statement entries win ties.
@@ -611,6 +641,39 @@ def calibrate_page_headers(doc) -> set:
     _hdr_sig_cache[key] = sigs
     _stmt_cap_cache[key] = {"pages": cap_pages, "sessions": cap_sessions}
     return sigs
+
+
+def calibrate_page_headers(doc) -> set:
+    """
+    Learn this document's running-header line signatures.
+
+    A running header is a document-level invariant: the same text (modulo
+    page numbers) printed at the same y in the top page band on a large
+    share of pages.  No genuine table row can repeat at one fixed y across
+    that many pages, so a signature qualifying here is never table content.
+    Signatures are keyed with a quantised y so a repeated column-header of
+    a long continuation table (whose y floats with content) cannot qualify,
+    while a book that moves its header between sections (平安, 中石油) yields
+    one qualifying key per placement.  Returns a set of signature strings;
+    empty set = headerless document, trim disabled (fail-open to the
+    current behaviour — a missed trim never breaks anything).
+
+    Side effect (C2/C6): the same single pass also collects statement-name
+    caption lines and stripped 附注 header lines into _stmt_cap_cache for the
+    output layer — see statement_caption_info.
+
+    track_p3b stage 3: the loop body lives in
+    calibrate_page_headers_scan_page and the book-level merge in
+    register_header_calibration so the v2 pipeline can scan pages in
+    parallel and register the merged result from the scheduler process;
+    this in-process wrapper keeps the legacy single-pass behaviour.
+    """
+    key = (doc.name, len(doc))
+    if key in _hdr_sig_cache:
+        return _hdr_sig_cache[key]
+
+    partials = [calibrate_page_headers_scan_page(page) for page in doc]
+    return register_header_calibration(doc.name, len(doc), partials)
 
 
 def _recover_top_remnant(page, H, V):
@@ -817,12 +880,21 @@ def detect_tables_on_page(
     page: fitz.Page,
     pix: fitz.Pixmap = None,
     zoom: float = PAGE_ZOOM,
+    yolo_fn=None,
 ):
     """
     Full detection pipeline for a single PDF page.
 
     Returns list of (x0, y0, x1, y1, confidence) in PDF points.
+
+    track_p3b stage 3: ``yolo_fn`` lets the v2 page-granular pipeline
+    substitute the in-process YOLO call with the resident GPU inference
+    service while keeping every geometric step identical.  It must accept
+    the same (pix, conf=...) contract as detect_tables_image; the default
+    (None) keeps the legacy in-process behaviour — zero behaviour change.
     """
+    if yolo_fn is None:
+        yolo_fn = detect_tables_image
     if pix is None:
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
@@ -846,7 +918,7 @@ def detect_tables_on_page(
         # signal that the low-confidence fallback pass is worth running.
         heuristic_table = looks_text_table(page, tuple(page.rect))
 
-    raw = detect_tables_image(pix)  # standard confidence pass
+    raw = yolo_fn(pix)  # standard confidence pass
 
     # Map → PDF and merge the standard pass FIRST.  The fallback dedup below
     # must run against the NMS *survivors*: a low-confidence page-spanning
@@ -863,7 +935,7 @@ def detect_tables_on_page(
         pdf_tables = merge_overlapping(pdf_tables)
 
     if heuristic_table:
-        raw_fb = detect_tables_image(pix, conf=YOLO_CONFIDENCE_FALLBACK)
+        raw_fb = yolo_fn(pix, conf=YOLO_CONFIDENCE_FALLBACK)
         if raw_fb:
             fb_pdf = image_to_pdf(
                 raw_fb,

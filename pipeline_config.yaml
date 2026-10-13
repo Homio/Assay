@@ -1,0 +1,51 @@
+# ============================================================================
+# track_p3b (P2 目标架构 · 阶段 3-4) — 页粒度流水线配置（唯一阈值源）
+#
+# 先例：eval/perf/config.yaml 是评测阈值唯一来源；本文件是 v2 管道全部
+# 调度/预算/看门狗阈值的唯一来源。代码中不硬编码任何本书/页数数值；
+# 算法阈值（GATEKEEPER_THRESHOLD=0.25、PAGE_ZOOM=2.0、YOLO conf 等）仍
+# 以 assay 包内既有常量为准，本文件不重复定义以免双源漂移。
+# ============================================================================
+
+# CPU 工作池规模（默认值；pipeline.run(num_workers=...) 传入 >1 的显式值
+# 时以传入值为准）。机器 20 核：17 worker + 1 调度器 + 1 GPU 服务 + 1 余量。
+workers: 17
+
+gpu_server:
+  # 三通道动态批上限。SLANet 真批（engine batch_size）实测 27-crop 单次
+  # run ≈7.3ms/crop（vs 逐张 22ms，bench_gpu_result.json）；PP-LCNet 批
+  # 64 实测 4.7ms/批；YOLO 为 ultralytics 逐页 predict（无张量真批），
+  # batch 上限仅控制单轮收集的请求数。
+  slanet_batch_max: 32
+  cls_batch_max: 64
+  yolo_drain_max: 8          # 单轮最多排队的 YOLO 页请求（无真批，仅流控）
+  # 每通道独立执行线程（track_p3b 终版）：窗口仅做零星请求的并发聚合
+  yolo_window_ms: 0          # yolo 无真批，到即执行
+  cls_window_ms: 3           # cls 单图 ~0.18ms，窗口只为聚合并发请求
+  slanet_window_ms: 5        # slanet 跨页聚合凑批（engine batch_size 真批）
+  slow_batch_ms: 2000        # 单批超过该耗时打 WARN 日志
+
+scheduler:
+  calib_chunk_pages: 32      # 页眉校准扫描分片大小（页/任务）
+  a_floor_fraction: 0.25     # A 类（文本）在制保底占比（×worker 数）
+  max_task_retries: 2        # 单任务失败重投上限（GPU 超时/瞬时错误）
+  gpu_timeout_s: 60.0        # worker 单次 GPU 请求等待上限
+  max_active_books: 50       # 同时开工的书上限（其余排队）
+
+budgets:
+  # 页预算调度器：在制页 ≤256、在制 crop ≤512、在制书 ≤50。
+  max_inflight_pages: 256
+  max_inflight_crops: 512
+  est_crops_per_page: 2      # B 任务发派时的 crop 预估（完成后按实数校正）
+
+watchdog:
+  sample_interval_s: 1.0     # 采样 /proc/meminfo 与 loadavg 的周期
+  # 内存水位（MiB，MemAvailable）：恒留 ~5GB 余量防 OOM。
+  pause_mem_available_mib: 6144    # <6GB：暂停发新任务（在制继续排空）
+  shrink_mem_available_mib: 5325    # <5.2GB：收缩活跃 worker 槽位
+  resume_mem_available_mib: 8192    # >8GB 且持续 resume_sustain_s：恢复
+  resume_sustain_s: 5.0
+  min_active_workers: 8       # 收缩下限（保住流水线基本并发）
+  loadavg_pause: 19.0        # load1 超过此值暂停扩槽（保 1 核余量）
+  heartbeat_stale_s: 3.0     # GPU 服务心跳过期秒数 → 判定降级并重启
+  startup_grace_s: 180.0     # GPU 服务启动（模型加载）期内心跳豁免时长

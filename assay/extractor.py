@@ -1745,6 +1745,213 @@ def build_table_from_slanet(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def prepare_page_slanet_data(
+    page: fitz.Page,
+    pix: fitz.Pixmap,
+    yolo_tables: List[Tuple[float, float, float, float, float]],
+    gate_fn,
+    structure_fn,
+    batch_size: int = GPU_BATCH_SIZE,
+) -> List[Tuple[Dict, Tuple[float, float, float, float]]]:
+    """Phase-2 body for ONE table-candidate page (track_p3b stage 3).
+
+    Pure code motion out of ``AssayExtractor.extract``: crop the detected
+    boxes, run the PP-LCNet gatekeeper on each crop, then SLANet structure
+    recognition on the survivors.  The v2 page-granular pipeline calls this
+    with GPU-server-backed gate_fn / structure_fn; the legacy in-process
+    path passes bound TableModel methods.  The algorithm (bbox padding,
+    image-coordinate mapping, gate order, structure chunking) is unchanged
+    — ``batch_size`` only controls the SLANet request granularity (results
+    are per-crop regardless of chunking).
+
+    Args:
+        page / pix:      candidate page and its PAGE_ZOOM rendering.
+        yolo_tables:     detection boxes in PDF points from detect_tables_on_page.
+        gate_fn:         crop_img -> bool (gatekeeper threshold baked in by caller).
+        structure_fn:    crop_specs -> List[Dict] (TableModel.process_crops contract).
+
+    Returns:
+        [(slanet_result, table_bbox), ...] in detection order.
+    """
+    scale_x = page.rect.width / pix.width
+    scale_y = page.rect.height / pix.height
+    if not yolo_tables:
+        return []
+
+    # QW#3: pix.samples → RGB ndarray → PIL Image.  No PNG round trip.
+    _pix_arr = np.frombuffer(
+        pix.samples, dtype=np.uint8
+    ).reshape(pix.height, pix.width, pix.n)
+    if _pix_arr.shape[2] > 3:
+        _pix_arr = _pix_arr[:, :, :3]
+    elif _pix_arr.shape[2] == 1:
+        _pix_arr = np.repeat(_pix_arr, 3, axis=2)
+    full_img = _Image.fromarray(_pix_arr)
+
+    page_crops: List[Dict] = []
+    page_meta: List[Dict] = []
+
+    for (pdf_x0, pdf_y0, pdf_x1, pdf_y1, conf) in yolo_tables:
+        # The detection bbox is already tight (ruling-line snap or
+        # text shrink).  Pad only a few points so SLANet sees the
+        # full glyphs sitting on the border lines — never the old
+        # greedy expansion that swallowed headers / body text.
+        orig_bbox = (pdf_x0, pdf_y0, pdf_x1, pdf_y1)
+        sub_x0, sub_y0, sub_x1, sub_y1 = _expand_bbox(
+            orig_bbox, pad_top=4.0, pad_bottom=4.0,
+            pad_left=4.0, pad_right=4.0, page_rect=page.rect
+        )
+
+        # Map PDF bbox → image-pixel coords
+        img_x0 = max(0, int(sub_x0 / scale_x))
+        img_y0 = max(0, int(sub_y0 / scale_y))
+        img_x1 = min(pix.width, int(sub_x1 / scale_x))
+        img_y1 = min(pix.height, int(sub_y1 / scale_y))
+
+        if img_x1 <= img_x0 or img_y1 <= img_y0:
+            continue
+
+        crop_img = full_img.crop((img_x0, img_y0, img_x1, img_y1))
+
+        # Step 4: PP-LCNet gatekeeper
+        if not gate_fn(crop_img):
+            continue
+
+        page_crops.append({
+            'image': crop_img,
+            'offset': (img_x0, img_y0),
+        })
+        page_meta.append({
+            'page_idx': page.number,
+            # store the tight detection bbox, NOT the padded crop
+            'table_bbox': orig_bbox,
+        })
+
+    # Step B: batch SLANet on this page's crops only.
+    pairs: List[Tuple[Dict, Tuple[float, float, float, float]]] = []
+    for batch_start in range(0, len(page_crops), batch_size):
+        batch_end = min(batch_start + batch_size, len(page_crops))
+        batch_crops = page_crops[batch_start:batch_end]
+        batch_meta = page_meta[batch_start:batch_end]
+
+        slanet_results = structure_fn(batch_crops)
+        for j, sres in enumerate(slanet_results):
+            meta = batch_meta[j]
+            pairs.append((sres, meta['table_bbox']))
+    return pairs
+
+
+def finalize_table_from_slanet(
+    sres: Dict,
+    page: fitz.Page,
+    page_idx: int,
+    scale_x: float,
+    scale_y: float,
+    table_bbox: Tuple[float, float, float, float],
+    page_hdr_rects: Optional[List[Tuple[float, float, float, float]]] = None,
+) -> Optional[TableOutput]:
+    """Phase-3 body for ONE (slanet_result, table_bbox) pair (track_p3b).
+
+    Pure code motion out of ``AssayExtractor.extract``: structure → PDF
+    coordinate mapping, phantom-table rejection, content-coverage
+    completion, the C3 rebuild-decline guard and header stripping — the
+    exact legacy per-table block.  Returns the finished TableOutput or
+    None (reject / zero-row).  The v2 build task (D) calls this in a worker
+    process; the legacy path calls it from extract() in place.
+    """
+    from assay.rulings import is_bordered_cell_table, is_partitioned_grid
+    from assay.splitting import looks_text_table
+
+    table_out = build_table_from_slanet(
+        sres, page, page_idx, scale_x, scale_y, table_bbox,
+        header_rects=page_hdr_rects
+    )
+    if table_out is None:
+        return None
+    # table_bbox is the trusted ruling-line / value-grid box from detection;
+    # it already bounds the table geometrically.  No text-content row
+    # trimming here and no grid-collapse reverse.  Each ruled table is its
+    # own detection candidate, so fission is unnecessary.
+    # Reject phantom tables: a single-column "table" is usually a 1×1 prose
+    # fragment, a 2×1 page header or garbled SLANet output.  Exceptions: a
+    # closed drawn grid whose interior dividers make cells of non-uniform
+    # height is a genuine bordered table (e.g. the "本次现金分红情况"
+    # dividend disclosure), and a borderless text table whose rows share a
+    # column gutter is one too — SLANet reads those as one column (often one
+    # giant 1×1 cell) because no ruling separates the cells (紫光 p146).  The
+    # gutter test brings its own multi-row requirement, so it needs no
+    # SLANet row count.  Both are decided geometrically — the ML table
+    # classifier actually scores such all-text tables *lower* than bordered
+    # prose callouts, so it cannot be used here.
+    if table_out.num_cols == 1:
+        if not ((table_out.num_rows >= 2 and
+                 (is_bordered_cell_table(page, table_bbox) or
+                  is_partitioned_grid(page, table_bbox))) or
+                looks_text_table(page, table_bbox)):
+            return None
+    if table_out.num_rows > 0:
+        # Content-coverage completion: pure content layer running AFTER
+        # every detection veto, on tables that survived on their own
+        # merits.  It replaces an under-segmented SLANet grid with a
+        # geometric rebuild (never adds/removes tables — see
+        # assay.completion for its self-checks).
+        if getattr(table_out, "ruled_grid", False):
+            # C5 矢量线网格修复过的表：行列边已是矢量线事实，
+            # complete_table 的结构触发器会把合法高折行行误判成行漂移而
+            # 拆毁正确网格，仅保留幂等文本修复；done=False 使下方 done
+            # 分支全部跳过
+            try:
+                from assay.completion import _apply_text_repairs
+                table_out.cells = _apply_text_repairs(table_out.cells)
+            except ImportError:
+                pass
+            done = False
+        else:
+            new_cells, nnr, nnc, done = complete_table(
+                page, table_bbox, table_out.cells,
+                table_out.num_rows, table_out.num_cols)
+        # C3 重建坍缩拒收：几何重建把多列表压成少数粗列、而区域行 x
+        # 起点簇数表明真实列数远多于此（诚志 p63：7 列承诺表压成 2 列，
+        # 600 字正文与标签错挂、竖排名单劈散），拒绝重建、保留经行原子
+        # 化 + 页眉过滤的 SLANet 网格。SLANet 误读出多余列的真坍缩场景
+        # （区域 x 起点簇数本就少）不受影响，仍由 complete_table 自身
+        # 守卫裁决
+        if done and nnc < table_out.num_cols:
+            _xcols = _region_xstart_columns(
+                page, table_bbox, page_hdr_rects)
+            # 第二条件收窄到 C3 形态学签名：区域内存
+            # 在通栏折行正文段（≥3 条 y 邻接、同 x0、低数字占比的宽
+            # 行）。密排数值表（右对齐散点起点簇多但无正文段）不受守
+            # 卫影响，仍允许 complete_table 正常坍缩重建
+            if _xcols >= max(table_out.num_cols, nnc + 3) \
+                    and _region_has_wide_wrapped_prose(
+                        page, table_bbox, page_hdr_rects):
+                _log.info(
+                    f"p{page_idx + 1} C3 rebuild declined: {nnc} cols < "
+                    f"{_xcols} x-start columns")
+                done = False
+                # 与 complete_table 自身拒绝路径的修饰处理保持一致（空
+                # 格/括号修复）。两个 helper 为 completion.py 侧新增接
+                # 口，缺省时跳过修饰保持对基线的兼容
+                try:
+                    from assay.completion import (
+                        _fix_cell_text_spaces, _repair_orphan_parens)
+                    table_out.cells = _repair_orphan_parens(
+                        _fix_cell_text_spaces(table_out.cells))
+                except ImportError:
+                    pass
+        if done:
+            table_out.cells = new_cells
+            table_out.num_rows = nnr
+            table_out.num_cols = nnc
+            table_out.completed = True
+        if page_hdr_rects:
+            table_out.cells = _strip_header_lines(
+                table_out.cells, page, page_hdr_rects)
+        return table_out
+    return None
+
+
 class AssayExtractor:
     """
     Extract tables and text from a PDF file using YOLO + SLANet + PyMuPDF.
@@ -1835,9 +2042,10 @@ class AssayExtractor:
             #     book-wide accumulator.  The page-local list is released
             #     at the end of each iteration, so peak RSS drops by
             #     ~1.5GB on a 296-page book.
-            page_crops: List[Dict] = []
-            page_meta: List[Dict] = []
-
+            # track_p3b stage 3: the per-page crop/gate/SLANet body now
+            # lives in prepare_page_slanet_data (module-level, shared with
+            # the v2 page-granular pipeline).  Same algorithm, same
+            # page-scoped accumulation (QW#3 + stage 2 streaming kept).
             for page_idx in table_page_indices:
                 page = doc[page_idx]
                 pix = page.get_pixmap(matrix=mat)
@@ -1852,84 +2060,14 @@ class AssayExtractor:
                 if not yolo_tables:
                     continue
 
-                # QW#3: pix.samples → RGB ndarray → PIL Image.  No PNG
-                # round trip.  pix.samples is (H, W, n) raw bytes; n is
-                # 3 for RGB, 4 for RGBA (CMYK renders → RGBA, we trim).
-                _pix_arr = np.frombuffer(
-                    pix.samples, dtype=np.uint8
-                ).reshape(pix.height, pix.width, pix.n)
-                if _pix_arr.shape[2] > 3:
-                    _pix_arr = _pix_arr[:, :, :3]
-                elif _pix_arr.shape[2] == 1:
-                    _pix_arr = np.repeat(_pix_arr, 3, axis=2)
-                full_img = _Image.fromarray(_pix_arr)
-
-                # Per-page crop accumulator — released at the end of the
-                # iteration, never accumulated across pages.
-                page_crops.clear()
-                page_meta.clear()
-
-                for (pdf_x0, pdf_y0, pdf_x1, pdf_y1, conf) in yolo_tables:
-                    # The detection bbox is already tight (ruling-line snap or
-                    # text shrink).  Pad only a few points so SLANet sees the
-                    # full glyphs sitting on the border lines — never the old
-                    # greedy expansion that swallowed headers / body text.
-                    orig_bbox = (pdf_x0, pdf_y0, pdf_x1, pdf_y1)
-                    sub_x0, sub_y0, sub_x1, sub_y1 = _expand_bbox(
-                        orig_bbox, pad_top=4.0, pad_bottom=4.0,
-                        pad_left=4.0, pad_right=4.0, page_rect=page.rect
-                    )
-
-                    # Map PDF bbox → image-pixel coords
-                    img_x0 = max(0, int(sub_x0 / scale_x))
-                    img_y0 = max(0, int(sub_y0 / scale_y))
-                    img_x1 = min(pix.width, int(sub_x1 / scale_x))
-                    img_y1 = min(pix.height, int(sub_y1 / scale_y))
-
-                    if img_x1 <= img_x0 or img_y1 <= img_y0:
-                        continue
-
-                    # Crop table region
-                    crop_img = full_img.crop((img_x0, img_y0, img_x1, img_y1))
-
-                    # Step 4: PP-LCNet gatekeeper
-                    if not self.model.is_table(crop_img, threshold=GATEKEEPER_THRESHOLD):
-                        continue
-
-                    page_crops.append({
-                        'image': crop_img,
-                        'offset': (img_x0, img_y0),
-                    })
-                    page_meta.append({
-                        'page_idx': page_idx,
-                        # store the tight detection bbox, NOT the padded crop
-                        'table_bbox': orig_bbox,
-                    })
-
-                # Step B (page-scoped): batch SLANet on this page's crops
-                # only.  When GPU_BATCH_SIZE=8 and a page holds 1-4 tables,
-                # most iterations call SLANet with a single batch — same
-                # semantics as the old book-wide loop, but the crop list
-                # never grows past one page.
-                for batch_start in range(0, len(page_crops), GPU_BATCH_SIZE):
-                    batch_end = min(batch_start + GPU_BATCH_SIZE, len(page_crops))
-                    batch_crops = page_crops[batch_start:batch_end]
-                    batch_meta = page_meta[batch_start:batch_end]
-
-                    slanet_results = self.model.process_crops(batch_crops)
-                    for j, sres in enumerate(slanet_results):
-                        meta = batch_meta[j]
-                        gpu_results.setdefault(meta['page_idx'], []).append(
-                            (sres, meta['table_bbox'])
-                        )
-
-                # Per-page release: drop the page's full image, crop list,
-                # and meta list so the next page starts cold.  ``full_img``
-                # and ``page_*`` are re-bound on the next loop iteration
-                # so the previous bindings become unreachable.
-                del full_img
-                page_crops.clear()
-                page_meta.clear()
+                pairs = prepare_page_slanet_data(
+                    page, pix, yolo_tables,
+                    lambda img, _m=self.model: _m.is_table(
+                        img, threshold=GATEKEEPER_THRESHOLD),
+                    self.model.process_crops,
+                )
+                if pairs:
+                    gpu_results.setdefault(page_idx, []).extend(pairs)
 
             # ── Phase 3: coordinate mapping + text extraction ────────────
             from assay.rulings import is_bordered_cell_table, is_partitioned_grid
@@ -1944,108 +2082,11 @@ class AssayExtractor:
                 page_hdr_rects = _running_header_rects(page, header_sigs)
 
                 for sres, table_bbox in slanet_data:
-                    table_out = build_table_from_slanet(
+                    table_out = finalize_table_from_slanet(
                         sres, page, page_idx, scale_x, scale_y, table_bbox,
-                        header_rects=page_hdr_rects
+                        page_hdr_rects=page_hdr_rects
                     )
-                    if table_out is None:
-                        continue
-                    # table_bbox is the trusted ruling-line / value-grid box
-                    # from detection; it already bounds the table geometrically.
-                    # No text-content row trimming here (that used to amputate
-                    # legitimate all-text rows like a signatory/address row) and
-                    # no grid-collapse reverse.  Each ruled table is its own
-                    # detection candidate, so fission is unnecessary.
-                    # Reject phantom tables: a single-column "table" is usually a
-                    # 1×1 prose fragment, a 2×1 page header or garbled SLANet
-                    # output.  Exceptions: a closed drawn grid whose interior
-                    # dividers make cells of non-uniform height is a genuine
-                    # bordered table (e.g. the "本次现金分红情况" dividend
-                    # disclosure), and a borderless text table whose rows share
-                    # a column gutter is one too — SLANet reads those as one
-                    # column (often one giant 1×1 cell) because no ruling
-                    # separates the cells (紫光 p146).  The gutter test brings
-                    # its own multi-row requirement, so it needs no SLANet row
-                    # count.  Both are decided geometrically — the ML table
-                    # classifier actually scores such all-text tables *lower*
-                    # than bordered prose callouts, so it cannot be used here.
-                    if table_out.num_cols == 1:
-                        if not ((table_out.num_rows >= 2 and
-                                 (is_bordered_cell_table(page, table_bbox) or
-                                  is_partitioned_grid(page, table_bbox))) or
-                                looks_text_table(page, table_bbox)):
-                            continue
-                    if table_out.num_rows > 0:
-                        # Content-coverage completion: pure content layer
-                        # running AFTER every detection veto, on tables
-                        # that survived on their own merits.  It replaces
-                        # an under-segmented SLANet grid with a geometric
-                        # rebuild (never adds/removes tables — see
-                        # assay.completion for its self-checks).
-                        if getattr(table_out, "ruled_grid", False):
-                            # C5 矢量线网格修复过的表：行列边已是矢量线
-                            # 事实，complete_table 的结构触发器会把合法
-                            # 高折行行误判成行漂移而拆毁正确网格，仅保留
-                            # 幂等文本修复；done=False 使下方 done 分支
-                            # 全部跳过
-                            try:
-                                from assay.completion import (
-                                    _apply_text_repairs)
-                                table_out.cells = _apply_text_repairs(
-                                    table_out.cells)
-                            except ImportError:
-                                pass
-                            done = False
-                        else:
-                            new_cells, nnr, nnc, done = complete_table(
-                                page, table_bbox, table_out.cells,
-                                table_out.num_rows, table_out.num_cols)
-                        # C3 重建坍缩拒收：几何重建把多列表压成少数粗
-                        # 列、而区域行 x 起点簇数表明真实列数远多于此
-                        # （诚志 p63：7 列承诺表压成 2 列，600 字正文与
-                        # 标签错挂、竖排名单劈散），拒绝重建、保留经行
-                        # 原子化 + 页眉过滤的 SLANet 网格。SLANet 误读
-                        # 出多余列的真坍缩场景（区域 x 起点簇数本就少）
-                        # 不受影响，仍由 complete_table 自身守卫裁决
-                        if done and nnc < table_out.num_cols:
-                            _xcols = _region_xstart_columns(
-                                page, table_bbox, page_hdr_rects)
-                            # 第二条件收窄到 C3 形态学签名：区域内存
-                            # 在通栏折行正文段（≥3 条 y 邻接、同 x0、
-                            # 低数字占比的宽行）。密排数值表（右对齐
-                            # 散点起点簇多但无正文段）不受守卫影响，
-                            # 仍允许 complete_table 正常坍缩重建
-                            if _xcols >= max(table_out.num_cols,
-                                             nnc + 3) \
-                                    and _region_has_wide_wrapped_prose(
-                                        page, table_bbox,
-                                        page_hdr_rects):
-                                _log.info(
-                                    f"p{page_idx + 1} C3 rebuild "
-                                    f"declined: {nnc} cols < "
-                                    f"{_xcols} x-start columns")
-                                done = False
-                                # 与 complete_table 自身拒绝路径的修饰处理
-                                # 保持一致（空格/括号修复）。两个 helper 为
-                                # completion.py 侧新增接口，缺省时跳过修饰
-                                # 保持对基线的兼容
-                                try:
-                                    from assay.completion import (
-                                        _fix_cell_text_spaces,
-                                        _repair_orphan_parens)
-                                    table_out.cells = _repair_orphan_parens(
-                                        _fix_cell_text_spaces(
-                                            table_out.cells))
-                                except ImportError:
-                                    pass
-                        if done:
-                            table_out.cells = new_cells
-                            table_out.num_rows = nnr
-                            table_out.num_cols = nnc
-                            table_out.completed = True
-                        if page_hdr_rects:
-                            table_out.cells = _strip_header_lines(
-                                table_out.cells, page, page_hdr_rects)
+                    if table_out is not None:
                         result.tables.append(table_out)
 
         except Exception as e:

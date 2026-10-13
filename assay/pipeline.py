@@ -150,6 +150,19 @@ def run(
     Returns:
         Total wall time in seconds.
     """
+    # track_p3b stage 4: directory mode (N>=2) with >=2 PDFs switches to
+    # the v2 page-granular pipeline (resident GPU inference service +
+    # page-level task scheduling).  Set ASSAY_PIPELINE=legacy to fall back
+    # to the per-file ProcessPoolExecutor path (single-file mode always
+    # uses legacy).  Same CLI, same output directory layout.
+    arch = os.environ.get("ASSAY_PIPELINE", "v2")
+    if arch == "v2":
+        pdfs_pre = sorted(Path(pdf_dir).glob("*.pdf"))
+        if len(pdfs_pre) >= 2:
+            from assay.scheduler_v2 import run_v2
+            return run_v2(pdf_dir, output_dir, num_workers, use_gpu,
+                          no_json, debug_pdf)
+
     pdfs = sorted(Path(pdf_dir).glob("*.pdf"))
     total = len(pdfs)
     if total == 0:
