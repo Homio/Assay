@@ -6,6 +6,20 @@ MinerU ONNX models (all run via ONNX Runtime, GPU or CPU):
   - PP-LCNet_x1_0_table_cls.onnx (6.5MB) — table/non-table classifier
 
 GPU support requires onnxruntime-gpu + CUDA 12 + cuDNN 9.
+
+track_p3a changes (stage 1 + quick wins 1/4/5):
+  - SLANet: pass use_cuda=True to rapid_table, then POST-REPLACE the
+    internal ORT session with a clean CUDA-configured one.  The default
+    rapid_table merge keeps `gpu_id: 0` from engine_cfg.yaml in
+    cuda_ep_cfg; ORT 1.22 rejects that key with "Unknown provider
+    option: gpu_id" and silently falls back to CPU.  Our replacement
+    uses only `device_id: 0` (the ORT 1.22 key).
+  - Both SLANet and PP-LCNet sessions now set
+    `intra_op_num_threads=1` explicitly.  In a 12-worker process pool
+    with OMP=1, ORT's default thread pool oversubscribes the host
+    (84ms → 21-23ms / crop on P1 micro-bench, ≈4× speedup even on CPU).
+  - TableModel remains a per-worker singleton via pipeline.py's
+    worker-level caching (see QW #1).
 """
 
 from __future__ import annotations
@@ -61,6 +75,12 @@ PPLCNET_PATH = str(MODEL_DIR / "PP-LCNet_x1_0_table_cls.onnx")
 GPU_BATCH_SIZE = 8
 PPLCNET_INPUT_SIZE = 224
 
+# QW #4: when 12 workers each spawn an ORT session, the default intra-op
+# thread pool (== nproc) oversubscribes the host.  Pinning to 1 thread per
+# session keeps the per-crop cost inside the worker predictable; the macro
+# can be overridden only by tests, never by hard-coded book/page numbers.
+ORT_INTRA_OP_THREADS = 1
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PP-LCNet table classifier (Step 4: gatekeeper)
@@ -78,12 +98,20 @@ class TableClassifier:
     def __init__(self, model_path: str = PPLCNET_PATH, use_gpu: bool = True):
         import onnxruntime as ort
 
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu
-            else ["CPUExecutionProvider"]
-        )
         sess_opts = ort.SessionOptions()
         sess_opts.log_severity_level = 3  # suppress warnings
+        sess_opts.intra_op_num_threads = ORT_INTRA_OP_THREADS  # QW #4
+
+        if use_gpu:
+            # QW #4 + stage 1: CUDA EP with device_id (NOT gpu_id, which
+            # ORT 1.22 rejects).  Keep CPU as fallback for transient init
+            # failures on a hot GPU.
+            providers = [
+                ("CUDAExecutionProvider", {"device_id": 0}),
+                ("CPUExecutionProvider", {}),
+            ]
+        else:
+            providers = ["CPUExecutionProvider"]
 
         self.session = ort.InferenceSession(
             model_path, sess_options=sess_opts, providers=providers
@@ -121,6 +149,47 @@ class TableClassifier:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ORT 1.22 CUDA EP options: device_id is the only GPU key it accepts.
+# We deliberately drop gpu_id (legacy), and reuse the strategy keys that
+# the rapid_table default cuda_ep_cfg carried (arena_extend_strategy,
+# cudnn_conv_algo_search, do_copy_in_default_stream) — they are
+# forward-compatible and don't trigger the "Unknown provider option" path.
+_SLANET_CUDA_EP_OPTS = {
+    "device_id": 0,
+    "arena_extend_strategy": "kNextPowerOfTwo",
+    "cudnn_conv_algo_search": "EXHAUSTIVE",
+    "do_copy_in_default_stream": True,
+}
+
+
+def _build_slanet_ort_session(model_path: str, use_gpu: bool):
+    """
+    Build a fresh ORT InferenceSession for SLANet, bypassing rapid_table's
+    session factory.  rapid_table's default cuda_ep_cfg in engine_cfg.yaml
+    contains a `gpu_id: 0` key (legacy CUDA key); ORT 1.22 sees it as an
+    "Unknown provider option" and falls back to CPU even when we pass
+    use_cuda: True.  This factory emits a clean provider list with only
+    the keys ORT 1.22 recognises.
+    """
+    import onnxruntime as ort
+
+    sess_opts = ort.SessionOptions()
+    sess_opts.log_severity_level = 3
+    sess_opts.intra_op_num_threads = ORT_INTRA_OP_THREADS  # QW #4
+
+    if use_gpu and "CUDAExecutionProvider" in ort.get_available_providers():
+        providers = [
+            ("CUDAExecutionProvider", dict(_SLANET_CUDA_EP_OPTS)),
+            ("CPUExecutionProvider", {}),
+        ]
+    else:
+        providers = ["CPUExecutionProvider"]
+
+    return ort.InferenceSession(
+        model_path, sess_options=sess_opts, providers=providers
+    )
+
+
 class TableStructureModel:
     """
     SLANet ONNX table structure recognition.
@@ -133,13 +202,18 @@ class TableStructureModel:
     def __init__(self, model_path: str = SLANET_PATH, use_gpu: bool = True):
         from rapid_table import RapidTable, RapidTableInput, ModelType, EngineType
 
-        engine_cfg = {}
-        if use_gpu:
-            # rapid_table uses ONNXRUNTIME engine; configure GPU providers
-            engine_cfg = {
-                "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-                "provider_options": [{"device_id": 0}],
-            }
+        # Pass use_cuda=True so rapid_table's ProviderConfig.get_ep_list()
+        # inserts CUDA at the head of the providers list.  The default
+        # cuda_ep_cfg still contains `gpu_id` from engine_cfg.yaml, so the
+        # initial session creation may fail and fall back to CPU.  The
+        # post-replace below swaps in a clean session either way.
+        engine_cfg = {
+            "use_cuda": bool(use_gpu),
+            # Explicit intra_op override is harmless here even though
+            # rapid_table's _init_sess_opts reads it; the swap below is the
+            # authoritative source.
+            "intra_op_num_threads": ORT_INTRA_OP_THREADS,
+        }
 
         cfg = RapidTableInput(
             model_type=ModelType.SLANETPLUS,
@@ -150,7 +224,21 @@ class TableStructureModel:
         )
         self.engine = RapidTable(cfg)
 
-        # Check what provider was actually used
+        # Stage 1 / QW #4 / QW (provider config fix): replace the inner
+        # ORT session with one whose provider options only carry ORT 1.22
+        # keys.  This is the only way to actually land SLANet on the GPU
+        # under the current rapid_table version (see docstring).
+        if use_gpu:
+            try:
+                new_session = _build_slanet_ort_session(model_path, use_gpu=True)
+                self.engine.table_structure.session.session = new_session
+            except Exception as e:
+                _log.warning(
+                    f"SLANet CUDA session build failed ({e}); keeping CPU fallback"
+                )
+
+        # Surface the actual provider for the task acceptance criterion
+        # ("日志出现 SLANet loaded (CUDAExecutionProvider)").
         try:
             session = self.engine.table_structure.session.session
             _actual = session.get_providers()[0]
@@ -179,6 +267,11 @@ class TableModel:
     Args:
         use_gpu: If True (default), run ONNX models on CUDA.
                  Falls back to CPU if CUDA unavailable.
+
+    QW #1: TableModel is now designed to be constructed once per worker
+    process.  The pipeline worker in pipeline.py caches a single instance
+    for the life of the worker; the 2.54s/file model load disappears for
+    every file after the first in the same worker.
     """
 
     def __init__(self, use_gpu: bool = True):

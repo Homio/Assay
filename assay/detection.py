@@ -126,18 +126,29 @@ def detect_tables_image(
 
     Returns:
         List of (x0, y0, x1, y1, confidence) in image-pixel coordinates.
+
+    track_p3a QW #2: bypass the tempfile PNG write and feed the raw RGB
+    ndarray straight into ultralytics.predict.  ultralytics natively accepts
+    a numpy array as ``source=``; on a 1190x1684 page the disk write+read
+    cost ~5-15 ms per call, multiplied across 12 workers x hundreds of
+    table pages it was a measurable slice of the 19.5 s YOLO stage in P1.
+    No algorithmic change: same model, same imgsz, same conf, same NMS
+    downstream.
     """
-    import tempfile
+    import numpy as _np
     model = _get_yolo()
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-        pix.save(tf.name)
-        img_path = tf.name
+    # pix.samples is RGB(A) uint8 already; shape it to (H, W, n) and trim
+    # to the first 3 channels if the source was RGBA / grayscale-alpha.
+    arr = _np.frombuffer(pix.samples, dtype=_np.uint8).reshape(
+        pix.height, pix.width, pix.n
+    )
+    if arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+    elif arr.shape[2] == 1:
+        arr = _np.repeat(arr, 3, axis=2)
 
-    try:
-        results = model.predict(source=img_path, imgsz=1024, conf=conf, verbose=False)
-    finally:
-        Path(img_path).unlink(missing_ok=True)
+    results = model.predict(source=arr, imgsz=1024, conf=conf, verbose=False)
 
     tables = []
     for result in results:

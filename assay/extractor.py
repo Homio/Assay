@@ -1823,9 +1823,20 @@ class AssayExtractor:
             # Cache pixmap + scale for Phase 3 (avoids redundant re-render)
             _page_cache: Dict[int, Tuple[float, float]] = {}
 
-            # Step A: collect all crops across all pages (PP-LCNet gatekeeping inline)
-            all_crops: List[Dict] = []
-            all_crop_meta: List[Dict] = []
+            # track_p3a QW#3 + stage 2 streaming:
+            #   - QW#3: skip the PNG encode+decode round trip on the full
+            #     page pixmap.  pix.samples is already RGB(A) uint8; we go
+            #     straight to ``Image.fromarray`` and crop.  Saves ~4.6s
+            #     on a 296-page book (3.6s encode + 1.0s decode) per P1.
+            #   - stage 2: SLANet batching moves INSIDE the per-page loop.
+            #     ``all_crops`` is page-scoped (one page at a time) instead
+            #     of book-scoped (whole book accumulated).  Single-page
+            #     crop list typically holds 0-5 PIL images vs ~330 in the
+            #     book-wide accumulator.  The page-local list is released
+            #     at the end of each iteration, so peak RSS drops by
+            #     ~1.5GB on a 296-page book.
+            page_crops: List[Dict] = []
+            page_meta: List[Dict] = []
 
             for page_idx in table_page_indices:
                 page = doc[page_idx]
@@ -1841,8 +1852,22 @@ class AssayExtractor:
                 if not yolo_tables:
                     continue
 
-                # Load full page image once for cropping
-                full_img = _Image.open(_io.BytesIO(pix.tobytes("png")))
+                # QW#3: pix.samples → RGB ndarray → PIL Image.  No PNG
+                # round trip.  pix.samples is (H, W, n) raw bytes; n is
+                # 3 for RGB, 4 for RGBA (CMYK renders → RGBA, we trim).
+                _pix_arr = np.frombuffer(
+                    pix.samples, dtype=np.uint8
+                ).reshape(pix.height, pix.width, pix.n)
+                if _pix_arr.shape[2] > 3:
+                    _pix_arr = _pix_arr[:, :, :3]
+                elif _pix_arr.shape[2] == 1:
+                    _pix_arr = np.repeat(_pix_arr, 3, axis=2)
+                full_img = _Image.fromarray(_pix_arr)
+
+                # Per-page crop accumulator — released at the end of the
+                # iteration, never accumulated across pages.
+                page_crops.clear()
+                page_meta.clear()
 
                 for (pdf_x0, pdf_y0, pdf_x1, pdf_y1, conf) in yolo_tables:
                     # The detection bbox is already tight (ruling-line snap or
@@ -1871,28 +1896,40 @@ class AssayExtractor:
                     if not self.model.is_table(crop_img, threshold=GATEKEEPER_THRESHOLD):
                         continue
 
-                    all_crops.append({
+                    page_crops.append({
                         'image': crop_img,
                         'offset': (img_x0, img_y0),
                     })
-                    all_crop_meta.append({
+                    page_meta.append({
                         'page_idx': page_idx,
                         # store the tight detection bbox, NOT the padded crop
                         'table_bbox': orig_bbox,
                     })
 
-            # Step B: batch SLANet structure recognition (Step 5)
-            for batch_start in range(0, len(all_crops), GPU_BATCH_SIZE):
-                batch_end = min(batch_start + GPU_BATCH_SIZE, len(all_crops))
-                batch_crops = all_crops[batch_start:batch_end]
-                batch_meta = all_crop_meta[batch_start:batch_end]
+                # Step B (page-scoped): batch SLANet on this page's crops
+                # only.  When GPU_BATCH_SIZE=8 and a page holds 1-4 tables,
+                # most iterations call SLANet with a single batch — same
+                # semantics as the old book-wide loop, but the crop list
+                # never grows past one page.
+                for batch_start in range(0, len(page_crops), GPU_BATCH_SIZE):
+                    batch_end = min(batch_start + GPU_BATCH_SIZE, len(page_crops))
+                    batch_crops = page_crops[batch_start:batch_end]
+                    batch_meta = page_meta[batch_start:batch_end]
 
-                slanet_results = self.model.process_crops(batch_crops)
-                for j, sres in enumerate(slanet_results):
-                    meta = batch_meta[j]
-                    gpu_results.setdefault(meta['page_idx'], []).append(
-                        (sres, meta['table_bbox'])
-                    )
+                    slanet_results = self.model.process_crops(batch_crops)
+                    for j, sres in enumerate(slanet_results):
+                        meta = batch_meta[j]
+                        gpu_results.setdefault(meta['page_idx'], []).append(
+                            (sres, meta['table_bbox'])
+                        )
+
+                # Per-page release: drop the page's full image, crop list,
+                # and meta list so the next page starts cold.  ``full_img``
+                # and ``page_*`` are re-bound on the next loop iteration
+                # so the previous bindings become unreachable.
+                del full_img
+                page_crops.clear()
+                page_meta.clear()
 
             # ── Phase 3: coordinate mapping + text extraction ────────────
             from assay.rulings import is_bordered_cell_table, is_partitioned_grid

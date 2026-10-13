@@ -25,6 +25,33 @@ _log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# track_p3a QW#1: per-worker TableModel singleton
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# In a ProcessPoolExecutor(spawn), each worker process is long-lived:
+# it handles many files in series.  Re-loading PP-LCNet + SLANet (≈2.54s,
+# plus 600+MB RSS jitter from CUDA context churn) on every _process_one
+# call is pure waste.  We cache the model at module scope so the first
+# file in a worker pays the load cost and every subsequent file skips it.
+#
+# ``_model_cache`` is process-local (spawn-forked), so each worker keeps
+# its own copy; the cache is correct under concurrent dispatch because
+# only one thread in a worker ever touches it (workers are single-
+# threaded by construction).
+_model_cache: dict = {}
+
+
+def _get_worker_model(use_gpu: bool):
+    """Return the per-worker TableModel singleton."""
+    cached = _model_cache.get("model")
+    if cached is None or cached.use_gpu != use_gpu:
+        from assay.models import TableModel as _TM
+        cached = _TM(use_gpu=use_gpu)
+        _model_cache["model"] = cached
+    return cached
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Per-file worker function (runs inside each ProcessPoolExecutor worker)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -48,7 +75,9 @@ def _process_one(args: Tuple[str, str, int, bool, bool, bool]) -> Dict:
     logging.getLogger("transformers").setLevel(logging.ERROR)
     torch.set_num_threads(1)
 
-    from assay.models import TableModel
+    # track_p3a QW#1: cached worker-level TableModel singleton
+    # (avoid reloading PP-LCNet + SLANet on every file).
+    model = _get_worker_model(use_gpu=use_gpu)
     from assay.extractor import AssayExtractor
     from assay.output import write_markdown, write_json, write_debug_pdf
 
@@ -56,7 +85,6 @@ def _process_one(args: Tuple[str, str, int, bool, bool, bool]) -> Dict:
     start_time = time.time()
 
     try:
-        model = TableModel(use_gpu=use_gpu)
         extractor = AssayExtractor(model)
         doc = extractor.extract(pdf_path)
 

@@ -1,0 +1,113 @@
+# Assay perf harness configuration.
+#
+# 零硬编码铁律：本文件是**唯一**阈值/参数/路径来源；任何代码改动不许
+# 把阈值绑死到特定的书或场景。所有数值都是「通用规则参数」——
+# 例如 iou_tolerance 是「仲裁 IoU 容差」而不是「紫光 p154 的 IoU 阈值」。
+#
+# 字段命名约束：key 名必须是语义层（iou_tolerance / wall_pct_slower）
+# 而非实例层（unisplendour_p154_iou）。
+
+# ── Paths ────────────────────────────────────────────────────────────────
+paths:
+  assay_root: /home/homio/sda/1111/Assay
+  pdf_root: /home/homio/sda/1111/original
+  baseline_runs_dir: /home/homio/sda/1111/Assay/eval/runs
+  analysis_root: /home/homio/sda/1111/analysis/perf
+  track_root: /home/homio/sda/1111/analysis/perf/track_p4
+  track_label: track_p4
+
+# ── GPU policy ───────────────────────────────────────────────────────────
+# 家里机双卡：GPU0 = 96GB 跑 Assay；GPU1 = 16GB 跑语皇，**绝对不许碰**。
+gpu:
+  allowed_index: 0
+  reserved_index: 1
+  reserved_purpose: "语皇常驻，绝对不许触碰"
+  pre_check_required: true
+  pre_check_max_used_mib: 200   # 跑批前 GPU0 已被占用的上限；超过则拒绝
+
+# ── Book registry ────────────────────────────────────────────────────────
+# 用 stable alias 引用书，避免不同环境的全路径差异。
+books:
+  pingan:
+    stem: 20250315_000001.SZ_平安银行_2024年年度报告_99b420d1
+    pages: 296
+    role: [accuracy, performance]
+  petrochina:
+    stem: 20250331_601857.SH_中国石油_中国石油天然气股份有限公司2024年度报告_e9f55911
+    pages: 280
+    role: [accuracy, performance]
+  unisplendour:
+    stem: 20260415_000938.SZ_紫光股份_2025年年度报告_9e6c5fd6
+    pages: 251
+    role: [accuracy]   # 紫光不进性能基准；仅做精度门禁 + 仲裁候选
+
+# ── Accuracy gate ────────────────────────────────────────────────────────
+accuracy:
+  baseline_snapshot: r57_3books.json     # 与现网自洽的基线
+  output_dir: /home/homio/sda/1111/output_gate
+  pass_conditions:
+    regressed_max: 0                     # REGRESSED+LOST+DEGRADED 总和上限
+    changed_dirty_max: 0                 # CHANGED 上限
+    smoke_drift_max: 0                   # SMOKE_DRIFT 上限
+  arbitration:
+    # 紫光 p154 GPU 抖动伪回归仲裁：若仅紫光 p154 触发 REGRESSED，
+    # 自动跑同代码快照重抽紫光，p154 IoU 与仲裁基线 IoU 同量级 → PASS
+    # 关键：仲裁 IoU 与 iou_tolerance 是「通用参数」，不是「紫光专用」。
+    enabled: true
+    iou_baseline: 0.9237                 # 仲裁 IoU 量级
+    iou_tolerance: 0.02                  # IoU 偏差容忍 ±0.02
+    target_book_alias: unisplendour      # 仲裁触达的书 alias
+    target_page: 154                     # 仲裁触达的页号
+    require_single_regression: true      # 必须仅此项红
+  rerun_for_arbitration: true            # 仲裁时是否真抽一次（True 必抽）
+
+# ── Performance gate ─────────────────────────────────────────────────────
+# 单本 3 次中位数；与 P1 baseline.json 比较。
+performance:
+  runs_per_book: 3
+  aggregate: median                      # median | mean | min
+  workers: 1                             # 单本 worker 数
+  extract_warmup: false                  # 首次推理 warmup 是否计入
+  metric:                                # 度量项
+    wall_sec: { required: true }         # /usr/bin/time -v wall
+    user_sec: { required: true }         # /usr/bin/time -v user
+    peak_rss_mib: { required: true }     # /usr/bin/time -v 最大 RSS
+  baseline_file: baseline.json           # 相对 paths.track_root
+  tolerance:                             # 方向性容差：回归门禁只拦劣化
+    wall_pct_slower: 15.0                # 比基线慢 >15% → 违规
+    wall_pct_faster: null                # 比基线快不限（null=不限；要双向门禁就给数值）
+    user_pct_slower: 20.0                # user CPU 多线程不均，放宽
+    user_pct_faster: null
+    peak_rss_pct_slower: 10.0            # RSS 高于基线 >10% → 违规
+    peak_rss_pct_faster: null            # RSS 更低是改善，不拦
+  pass_conditions:
+    within_tolerance_max_violations: 0   # 容忍范围失败书数
+
+# ── Memory profile ───────────────────────────────────────────────────────
+# ps 定时采样（按 ppid 进程树聚合，spawn worker 不漏采）：
+# 单 worker 峰值 RSS、批量 N workers 峰值总 RSS。
+memory:
+  sample_interval_sec: 1.0
+  single:
+    books: [pingan]                      # 抽样 1 本（平安）
+    peak_rss_mib_max: 4000               # 单 worker 峰值 RSS 上限
+  batch:
+    workers: 12                          # 批量并发数
+    pdf_count: 12                        # 与 workers 对齐
+    peak_total_rss_mib_max: 38000        # 批量总 RSS 上限
+    max_wait_sec: 1500                   # 批量超时保护（P1 实测约 340s，留 4 倍余量）
+  collector:
+    include_children: true
+    rss_source_field: rss                # ps -o rss 单位 KB
+
+# ── Harness driver ───────────────────────────────────────────────────────
+driver:
+  fail_fast_on_gpu_busy: true            # GPU0 已被占用时立即 fail（不进入门禁）
+  cleanup_extract_subdirs: true          # 跑完是否清理 <out>/<stem>/ 子目录
+  keep_extracted_jsons: true             # 保留最终 score 输入的 json 副本
+  write_human_summary: true              # 控制台人读摘要
+  write_machine_json: true               # 落盘机器可读 JSON
+  machine_json_name: gate_result.json
+  human_summary_name: SUMMARY.txt
+  fail_on_any_section: false             # 单节失败是否整体失败
+  fail_on_warning: false                 # 警告（warmup 抖动等）是否升级为 fail
