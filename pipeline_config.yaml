@@ -47,7 +47,6 @@ gpu_server:
   split_servers: false       # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
 
 scheduler:
-  worker_lanes: 4            # track_p5：每 worker 进程内车道数（1=P3b 单车道回退）
   worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）
   calib_chunk_pages: 32      # 页眉校准扫描分片大小（页/任务）
   a_floor_fraction: 0.25     # A 类（文本）在制保底占比（×worker 数）
