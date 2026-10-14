@@ -389,7 +389,7 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
         all_cell_bboxes: List = []
         all_logic_points: List = []
         for s in range(0, len(ori_imgs), cslanet_max):
-            chunk = ori_imgs[s:s + slanet_max]
+            chunk = ori_imgs[s:s + cslanet_max]
             prep = list(_sl_prep_pool.map(_sl_prep_one, chunk))
             imgs = [im for im, _sh in prep]
             shape_arrs = [sh for _im, sh in prep]   # 每图 (1,6)
@@ -440,6 +440,22 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
             fut_sl = _exec_pool.submit(_slanet_all, all_crops)
             probs = fut_cls.result()
             cb_list, lp_list = fut_sl.result()
+            # 防御层：推理结果数量必须与请求 crop 数一致，否则整批回错
+            # （fail-loud），绝不允许静默补空数组把坏结果喂给下游。
+            if len(probs) != n or len(cb_list) != n or len(lp_list) != n:
+                _log.error(
+                    "[gpu-server] cslanet result length mismatch: "
+                    f"requested {n} crops, got probs={len(probs)}, "
+                    f"cell_bboxes={len(cb_list)}, "
+                    f"logic_points={len(lp_list)}; failing whole batch")
+                for req, _k in req_sizes:
+                    _reply(req, False,
+                           "slanet result length mismatch: "
+                           f"requested {n}, probs={len(probs)}, "
+                           f"cell_bboxes={len(cb_list)}, "
+                           f"logic_points={len(lp_list)}")
+                buf.clear()
+                return
             i = 0
             for req, k in req_sizes:
                 out: List[Dict] = []
