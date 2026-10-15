@@ -56,6 +56,15 @@ MIN_DIGITS_SIGNAL2 = 30
 MIN_TABLE_GRID_WIDTH = 200.0  # a drawn ruling grid at least this wide marks a
                               # page as table-bearing regardless of digit count
 
+# track_p5 P14a (P13c integrated): s1 (digit density) alone no longer
+# short-circuits the candidate check. Additional column-zone digit
+# evidence is required. Layout-only constants -- no company/doc/specific
+# numeric patterns (same family as TEXT_TABLE_GUTTER): 8pt span gap,
+# 4pt y-merge tolerance, digit-count threshold 10 (max under the
+# zero-skip constraint on the b10+all13 set; see PAGE_FILTER.md sec 4).
+_COL_RUN_Y_TOL = 4.0           # y-merge tolerance to repair per-cell block splits (pt)
+_COL_RUN_DIGITS_MIN = 10       # column-zone digit count threshold
+
 # PP-LCNet gatekeeper threshold
 # PP-LCNet was trained on general (English) tables and systematically
 # scores Chinese financial tables at ~0.29, while scoring clear non-tables
@@ -85,7 +94,13 @@ def page_has_table(page: fitz.Page) -> bool:
     density = digit_count / total_chars
 
     if digit_count >= MIN_DIGITS_FOR_TABLE and density >= MIN_DIGIT_DENSITY:
-        return True
+        # track_p5 P14a: s1 (digit density) alone is no longer sufficient
+        # -- require column-zone digit evidence to filter prose-with-digits
+        # false positives. s2/s3/s4 below remain unchanged; lower-bound
+        # caveat in PAGE_FILTER.md sec 4.
+        if _col_run_digits(page) >= _COL_RUN_DIGITS_MIN:
+            return True
+        # s1 evidence insufficient; fall through to s2/s3/s4.
 
     if digit_count >= 100:
         drawings = page.get_drawings()
@@ -111,6 +126,59 @@ def page_has_table(page: fitz.Page) -> bool:
         return True
 
     return False
+
+
+def _col_run_digits(page: "fitz.Page") -> int:
+    """track_p5 P14a (P13c integrated): column-zone digit count.
+
+    Returns the maximum per-page value of digit characters inside any
+    'column zone' (best_dig). Layout-only -- no company/doc/specific
+    numeric patterns; same family as the existing _colrow_ok /
+    looks_text_table helpers (8pt span gap = TEXT_TABLE_GUTTER, 4pt
+    y-merge tolerance, plain digit-character counting).
+
+    Implementation:
+      - read page.get_text("dict") all lines (y0, spans);
+      - merge lines with |dy| <= 4pt to repair per-cell block splits
+        (Chinese table cells are commonly split into independent blocks
+        by PDF producers);
+      - scan consecutive row bands: a band is a 'column zone' when
+        every line has >= 2 spans AND there is a >= 8pt span gap;
+      - accumulate digit characters inside the band, take the max.
+    """
+    from assay.splitting import TEXT_TABLE_GUTTER
+    d = page.get_text("dict")
+    dlines = []
+    for blk in d.get("blocks", []):
+        for ln in blk.get("lines", []):
+            spans = [(s["bbox"][0], s["bbox"][2], s["text"])
+                     for s in ln.get("spans", [])]
+            if spans:
+                dlines.append((ln["bbox"][1], spans))
+    dlines.sort(key=lambda t: t[0])
+    # merge same-y row bands (block structure split repair)
+    merged = []
+    for y, spans in dlines:
+        if merged and abs(merged[-1][0] - y) <= _COL_RUN_Y_TOL:
+            merged[-1][1].extend(spans)
+            merged[-1][0] = (merged[-1][0] + y) / 2
+        else:
+            merged.append([y, list(spans)])
+    best_dig = 0
+    col_run_digits = 0
+    for y, spans in merged:
+        spans.sort()
+        gaps = [b[0] - a[1] for a, b in zip(spans, spans[1:])]
+        multi = len(spans) >= 2 and any(g >= TEXT_TABLE_GUTTER for g in gaps)
+        if multi:
+            col_run_digits += sum(c.isdigit() for _, _, t in spans for c in t)
+            if col_run_digits > best_dig:
+                best_dig = col_run_digits
+        else:
+            col_run_digits = 0
+    return best_dig
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────

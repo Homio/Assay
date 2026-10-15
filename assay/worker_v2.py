@@ -106,8 +106,17 @@ def run_detect(task, client, fused_calls=False):
     else:
         # yolo_fn 与 detection.detect_tables_image 同契约（pix, conf=…），
         # 采样通道裁剪与 detect_tables_image 逐行一致；内部走 GPU 服务。
+        # track_p5 P13a：单前向双 conf——一次 yolo_detect(conf=0.0) 拿
+        # 全 top-300 候选，worker 端按调用方传入的 conf 阈值分流；fused
+        # 路径（上方）不动。等价性见 analysis/perf/track_p5/
+        # YOLO_DUALCONF_SPIKE.md §一（v10postprocess 顺序验证）+ §二
+        # （平安银行 296 页逐位 diff 0/296）。
+        _yolo_dual_cache = [None, None]  # [pix_id, all_tables]
         def _yolo_fn(pix, conf=YOLO_CONFIDENCE):
-            return client.yolo_detect(_pix_arr(pix), conf)
+            if _yolo_dual_cache[0] is not pix:
+                _yolo_dual_cache[1] = client.yolo_detect(_pix_arr(pix), 0.0)
+                _yolo_dual_cache[0] = pix
+            return [t for t in _yolo_dual_cache[1] if t[4] > conf]
 
         yolo_tables = detect_tables_on_page(
             page, pix, PAGE_ZOOM, yolo_fn=_yolo_fn)
