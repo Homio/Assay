@@ -44,7 +44,7 @@ gpu_server:
   yolo2_pred_threads: 2      # std/fb 双组 predict 并行度（1=串行回退）
   cslanet_window_ms: 350     # track_p5: 凑满48窗口（到达率~40crops/s时批~35-48）
   exec_debug: false           # track_p5: 通道执行分解计时（诊断开关，默认 false）
-  split_servers: false       # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
+  split_servers: true        # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
 
 scheduler:
   worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）

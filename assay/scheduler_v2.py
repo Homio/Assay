@@ -120,6 +120,10 @@ class SchedulerV2:
 
         self.wd_cfg = wd
         self.gpu_cfg = cfg.get("gpu_server") or {}
+        # track_p5/p13b：GPU 服务拆分双进程（yolo 服务 / cls+slanet
+        # 服务），各自独立 GIL/CUDA 上下文；默认 false = 单服务回退。
+        self.split_servers = bool(self.gpu_cfg.get(
+            "split_servers", False))
 
         self.inflight_pages = 0
         self.inflight_crops = 0
@@ -128,6 +132,9 @@ class SchedulerV2:
         self.task_q = self.ctx.Queue()
         self.result_q = self.ctx.Queue()
         self.infer_q = self.ctx.Queue()
+        # track_p5/p13b 拆分服务：cls/slanet/cslanet 专用请求队列
+        #（仅 split_servers 时被服务进程消费，空闲队列零成本）。
+        self.infer_q_csl = self.ctx.Queue()
         # track_p3b 集成修复：mp.Queue 不能作为消息体跨队列 pickle，
         # 每 worker 专属回包队列改为进程创建时按继承传递。
         self.reply_queues = [self.ctx.Queue()
@@ -141,7 +148,7 @@ class SchedulerV2:
         self.active: List[_Book] = []
         self.rr_ptr = 0
 
-        self.gpu_proc = None
+        self.gpu_procs = []
         self.gpu_restarts = 0
         self.gpu_spawn_t = 0.0
         self._restart_requested = threading.Event()
@@ -175,13 +182,27 @@ class SchedulerV2:
     def _spawn_gpu_server(self):
         from assay.gpu_server import gpu_server_main
         self.gpu_spawn_t = time.time()
-        self.gpu_proc = self.ctx.Process(
-            target=gpu_server_main,
-            args=(self.infer_q, self.heartbeat, self.reply_queues,
-                  dict(self.gpu_cfg)),
-            name="gpu-server", daemon=False)
-        self.gpu_proc.start()
-        _log.info("[v2] gpu server spawned (pid %s)", self.gpu_proc.pid)
+        if self.split_servers:
+            # track_p5/p13b 拆分双进程：各自独立 GIL/解释器；共享同一
+            # heartbeat（任一进程活着即新鲜——单进程崩溃由其任务
+            # 超时兜底重投）与同一 reply_queues（wid 路由不变）。
+            specs = [
+                ("gpu-server-yolo", self.infer_q, {"yolo", "yolo2"}),
+                ("gpu-server-cslanet", self.infer_q_csl,
+                 {"cls", "slanet", "cslanet"}),
+            ]
+        else:
+            specs = [("gpu-server", self.infer_q, None)]
+        self.gpu_procs = []
+        for name, q, serve in specs:
+            p = self.ctx.Process(
+                target=gpu_server_main,
+                args=(q, self.heartbeat, self.reply_queues,
+                      dict(self.gpu_cfg), serve),
+                name=name, daemon=False)
+            p.start()
+            self.gpu_procs.append(p)
+            _log.info("[v2] gpu server %s spawned (pid %s)", name, p.pid)
 
     def _maybe_restart_gpu_server(self):
         if not self._restart_requested.is_set():
@@ -190,12 +211,13 @@ class SchedulerV2:
         self.gpu_restarts += 1
         _log.error("[v2] gpu server heartbeat stale — restarting (#%d)",
                    self.gpu_restarts)
-        if self.gpu_proc is not None and self.gpu_proc.is_alive():
-            self.gpu_proc.terminate()
-            self.gpu_proc.join(5)
-            if self.gpu_proc.is_alive():
-                self.gpu_proc.kill()
-                self.gpu_proc.join(5)
+        for p in getattr(self, "gpu_procs", []) or []:
+            if p.is_alive():
+                p.terminate()
+                p.join(5)
+                if p.is_alive():
+                    p.kill()
+                    p.join(5)
         self._spawn_gpu_server()
 
     # ── 书注册与激活 ────────────────────────────────────────────────────
@@ -534,7 +556,9 @@ class SchedulerV2:
             p = self.ctx.Process(target=worker_main,
                                  args=(i, self.task_q, self.result_q,
                                        self.infer_q, self.reply_queues[i],
-                                       self.active_slots, worker_cfg),
+                                       self.active_slots, worker_cfg,
+                                       self.infer_q_csl
+                                       if self.split_servers else None),
                                  name=f"worker-{i:02d}", daemon=False)
             p.start()
             workers.append(p)
@@ -581,8 +605,10 @@ class SchedulerV2:
         for p in workers:
             p.join(30)
         self.infer_q.put(None)
-        if self.gpu_proc is not None:
-            self.gpu_proc.join(30)
+        if self.split_servers:
+            self.infer_q_csl.put(None)
+        for p in self.gpu_procs:
+            p.join(30)
 
         elapsed = time.time() - t_start
         total = len(self.books)

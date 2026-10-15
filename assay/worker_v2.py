@@ -173,7 +173,7 @@ def run_build(task):
 
 
 def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
-                 active_slots, cfg):
+                 active_slots, cfg, infer_q_csl=None):
     """
     Worker 进程入口。
 
@@ -191,7 +191,10 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
     # pipeline_config.yaml gpu_server.fused_calls）。false = P3b 三通道
     # 路径，逐位不变。
     fused_calls = bool(cfg.get("fused_calls", False))
-    client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s)
+    # track_p5/p13b 拆分服务：cls/slanet/cslanet 请求走独立服务队列
+    #（None = 单服务 legacy，全部走 infer_q）。
+    client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s,
+                       infer_q_csl=infer_q_csl)
 
     while True:
         # 槽位收缩：序号在槽外的 worker 睡眠让核（恒留 1 核 + 5GB 的

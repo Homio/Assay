@@ -44,7 +44,8 @@ class GpuServerError(RuntimeError):
     """GPU 服务端在执行批次时抛出的异常（透传给 worker 的任务重试层）。"""
 
 
-def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
+def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
+                    serve_channels=None) -> None:
     """
     GPU 服务进程入口。
 
@@ -76,31 +77,40 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
         PPLCNET_INPUT_SIZE,
     )
 
+    # track_p5/p13b 拆分服务：只加载本进程通道需要的模型（cslanet
+    # 服务不构建 torch YOLO）。
+    _need_yolo = serve_channels is None or not serve_channels.isdisjoint(
+        {"yolo", "yolo2"})
+    _need_tab = serve_channels is None or not serve_channels.isdisjoint(
+        {"cls", "slanet", "cslanet"})
     heartbeat.value = time.time()
-    yolo = _get_yolo()
+    yolo = _get_yolo() if _need_yolo else None
     heartbeat.value = time.time()
-    clf = TableClassifier(use_gpu=True)
+    clf = TableClassifier(use_gpu=True) if _need_tab else None
     heartbeat.value = time.time()
-    slanet = TableStructureModel(use_gpu=True)
+    slanet = TableStructureModel(use_gpu=True) if _need_tab else None
     heartbeat.value = time.time()
     # track_p3b 诊断：显式自报各模型实际 EP / 设备（spawn 子进程日志级别
     # 默认 WARNING，_log.info 不可见 —— 用 stderr 直出）
     try:
-        print(f"[gpu-server] clf providers="
-              f"{clf.session.get_providers()}", flush=True)
+        if clf is not None:
+            print(f"[gpu-server] clf providers="
+                  f"{clf.session.get_providers()}", flush=True)
     except Exception as e:
         print(f"[gpu-server] clf probe fail: {e}", flush=True)
     try:
-        _sl_sess = slanet.engine.table_structure.session.session
-        print(f"[gpu-server] slanet providers="
-              f"{_sl_sess.get_providers()}", flush=True)
+        if slanet is not None:
+            _sl_sess = slanet.engine.table_structure.session.session
+            print(f"[gpu-server] slanet providers="
+                  f"{_sl_sess.get_providers()}", flush=True)
     except Exception as e:
         print(f"[gpu-server] slanet probe fail: {e}", flush=True)
     try:
-        import torch
-        print(f"[gpu-server] torch cuda={torch.cuda.is_available()} "
-              f"dev={torch.cuda.current_device() if torch.cuda.is_available() else -1}",
-              flush=True)
+        if _need_yolo:
+            import torch
+            print(f"[gpu-server] torch cuda={torch.cuda.is_available()} "
+                  f"dev={torch.cuda.current_device() if torch.cuda.is_available() else -1}",
+                  flush=True)
     except Exception as e:
         print(f"[gpu-server] torch probe fail: {e}", flush=True)
     _log.info("[gpu-server] models loaded (YOLO + PP-LCNet + SLANet, cuda:0)")
@@ -252,11 +262,12 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
             _log.warning(f"[gpu-server] slow slanet batch: {dt_ms:.0f}ms "
                          f"({n} crops)")
 
-    channels = {
-        "yolo": (deque(), _run_yolo),
-        "cls": (deque(), _run_cls),
-        "slanet": (deque(), _run_slanet),
-    }
+    channels = {}
+    if _need_yolo:
+        channels["yolo"] = (deque(), _run_yolo)
+    if _need_tab:
+        channels["cls"] = (deque(), _run_cls)
+        channels["slanet"] = (deque(), _run_slanet)
 
     # ── track_p5：合并调用通道 ──────────────────────────────────────────
     def _run_yolo2(buf: deque):
@@ -340,8 +351,10 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
     _yolo2_pool = _cf.ThreadPoolExecutor(
         max_workers=yolo2_pred_threads, thread_name_prefix="gpu-yolo2pred")
 
-    _rt = slanet.engine          # RapidTable
-    _ts = _rt.table_structure     # PPTableStructurer
+    # track_p5/p13b 拆分服务：yolo 服务不加载 slanet，_rt/_ts 仅在
+    # cls+slanet 服务进程内有效。
+    _rt = slanet.engine if slanet is not None else None
+    _ts = _rt.table_structure if _rt is not None else None
 
     def _cls_probs(crop_list) -> List[float]:
         """PP-LCNet 门控概率（与 _run_cls 同一数学，预处理池化并行）。"""
@@ -483,8 +496,10 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg) -> None:
             _log.warning(f"[gpu-server] slow cslanet batch: {dt_ms:.0f}ms "
                          f"({n} crops)")
 
-    channels["yolo2"] = (deque(), _run_yolo2)
-    channels["cslanet"] = (deque(), _run_cslanet)
+    if _need_yolo:
+        channels["yolo2"] = (deque(), _run_yolo2)
+    if _need_tab:
+        channels["cslanet"] = (deque(), _run_cslanet)
     exit_seen = False
     # track_p3b 诊断：各通道实际执行条数与耗时
     exec_stats: Dict[str, list] = {"yolo": [0, 0.0, 0],
@@ -638,8 +653,12 @@ class GpuClient:
     """
 
     def __init__(self, infer_q, reply_q, worker_id,
-                 timeout_s: float = 60.0):
+                 timeout_s: float = 60.0, infer_q_csl=None):
         self.infer_q = infer_q
+        # track_p5/p13b 拆分服务：cls/slanet/cslanet 请求走独立服务
+        # 进程的队列（None = 单服务 legacy，全部走 infer_q）。同一
+        # 客户端单一 rid 序列、单一回包队列，两路回包按 rid 区分。
+        self.infer_q_csl = infer_q_csl
         # reply_q is passed by inheritance at worker process creation
         # (an mp.Queue cannot be pickled as a queue payload); requests
         # carry only the wid and the server routes replies by wid.
@@ -662,8 +681,12 @@ class GpuClient:
 
     def _call_impl(self, ch: str, payload):
         rid = next(self._rids)
-        self.infer_q.put({"ch": ch, "rid": rid, "wid": self.wid,
-                          "payload": payload})
+        _q = self.infer_q
+        if self.infer_q_csl is not None and ch in ("cls", "slanet",
+                                                   "cslanet"):
+            _q = self.infer_q_csl
+        _q.put({"ch": ch, "rid": rid, "wid": self.wid,
+                "payload": payload})
         deadline = time.monotonic() + self.timeout_s
         while True:
             remaining = deadline - time.monotonic()
