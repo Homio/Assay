@@ -50,7 +50,7 @@ gpu_server:
   # 即从共享任务队列窃取任务执行（text/build/calib 任意，detect 受
   # async_depth 每 worker 在途上限封顶；剩余超时预算 < async_guard_s
   # 不偷，防超时误杀）。
-  async_pipeline: false
+  async_pipeline: true
   async_depth: 2
   async_wait_ms: 50
   async_guard_s: 10
@@ -80,3 +80,11 @@ watchdog:
   loadavg_pause: 19.0        # load1 超过此值暂停扩槽（保 1 核余量）
   heartbeat_stale_s: 3.0     # GPU 服务心跳过期秒数 → 判定降级并重启
   startup_grace_s: 180.0     # GPU 服务启动（模型加载）期内心跳豁免时长
+
+# P19c dedup section
+dedup:
+  enabled: true
+  cache_dir: /home/homio/sda/1111/dedup_cache
+  hash_workers: 8
+  # cache key = content_hash + code_rev + cfg_canon + EXPORT_FORMAT_SIG
+  # cache scope: per-book per-pipeline-sig; shadow books reuse main's payload

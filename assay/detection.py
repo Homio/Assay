@@ -519,6 +519,19 @@ def statement_caption_info(stem: str) -> dict:
     return {}
 
 
+def peek_statement_caption_info(doc_name, n_pages):
+    """P19c dedup：取 (doc_name, n_pages) 的原始缓存条目（引用，无拷贝）；
+    未注册返回 None。主本完成时定格进复用载荷 / 缓存载荷。"""
+    return _stmt_cap_cache.get((doc_name, n_pages))
+
+
+def register_statement_caption_info(doc_name, n_pages, info):
+    """P19c dedup：把捕获的 caption 条目登记到另一本书名下（同内容、
+    不同路径的影子/缓存复用路径）。导出层 statement_caption_info 按文件
+    stem 匹配 → 复用本的 caption plan 与独立提取逐字节一致。"""
+    _stmt_cap_cache[(doc_name, n_pages)] = info
+
+
 def calibrate_page_headers_scan_page(page) -> dict:
     """
     Per-page scan body of calibrate_page_headers (track_p3b stage 3 split).
