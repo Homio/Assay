@@ -45,6 +45,15 @@ gpu_server:
   cslanet_window_ms: 350     # track_p5: 凑满48窗口（到达率~40crops/s时批~35-48）
   exec_debug: false           # track_p5: 通道执行分解计时（诊断开关，默认 false）
   split_servers: true        # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
+  # ── track_p5/P17 spike：worker 异步流水（detect 等待期任务窃取） ──
+  # false = 未 armed 逐位 legacy；true 后 GPU 回包等待超 async_wait_ms
+  # 即从共享任务队列窃取任务执行（text/build/calib 任意，detect 受
+  # async_depth 每 worker 在途上限封顶；剩余超时预算 < async_guard_s
+  # 不偷，防超时误杀）。
+  async_pipeline: false
+  async_depth: 2
+  async_wait_ms: 50
+  async_guard_s: 10
 
 scheduler:
   worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）

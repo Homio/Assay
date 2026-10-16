@@ -670,16 +670,26 @@ class GpuClient:
         self.stats = {"yolo": [0, 0.0], "cls": [0, 0.0], "slanet": [0, 0.0],
                       # track_p5 合并通道
                       "yolo2": [0, 0.0], "cslanet": [0, 0.0]}
+        # ── track_p5/P17 spike：异步流水（detect 等待期任务窃取）状态 ──
+        # _steal_cfg 非 None 才启用；未 armed 的客户端行为 = 逐位 legacy。
+        self._steal_cfg = None
+        self._task_q = None
+        self._active_slots = None
+        self._runner = None
+        self._reply_cache = {}   # rid -> (ok, data)：并发帧回包归还
+        self._ctx_stack = []     # 任务记账栈（嵌套 steal 时每任务一层）
+        self._detect_open = 0
+        self._stash = deque()
+        self._saw_sentinel = False
+        self.steal_n = 0
+        self.steal_s = 0.0
+        self.max_depth = 0
 
     def _call(self, ch: str, payload):
-        _t0 = time.monotonic()
-        try:
-            return self._call_impl(ch, payload)
-        finally:
-            self.stats[ch][0] += 1
-            self.stats[ch][1] += time.monotonic() - _t0
+        return self._call_impl(ch, payload)
 
-    def _call_impl(self, ch: str, payload):
+    def _call_impl(self, ch, payload):
+        _t0 = time.monotonic()
         rid = next(self._rids)
         _q = self.infer_q
         if self.infer_q_csl is not None and ch in ("cls", "slanet",
@@ -687,22 +697,117 @@ class GpuClient:
             _q = self.infer_q_csl
         _q.put({"ch": ch, "rid": rid, "wid": self.wid,
                 "payload": payload})
+        # P17 spike：同 worker 可有多在途 rid（嵌套窃取）→ 回包一律先按
+        # rid 匹配，不匹配的进 _reply_cache 归还对应帧，绝不丢弃。
+        # GPU 记账按 ctx 独立累计（嵌套任务绝不重复计入外层任务）。
+        ctx = self._ctx_stack[-1] if self._ctx_stack else None
+        gstats = ctx["gpu"][ch] if ctx is not None else self.stats[ch]
+        stolen_here = [0.0]
         deadline = time.monotonic() + self.timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise GpuServerError(
-                    f"gpu server timeout after {self.timeout_s:.0f}s "
-                    f"(ch={ch}, rid={rid})")
-            try:
-                r_rid, ok, data = self.reply_q.get(timeout=remaining)
-            except Exception:
-                continue
-            if r_rid != rid:
-                continue  # 迟到的旧请求回包，丢弃
-            if not ok:
-                raise GpuServerError(f"gpu server error (ch={ch}): {data}")
-            return data
+        step = (self._steal_cfg["wait_ms"] / 1000.0
+                if self._steal_cfg else None)
+        try:
+            while True:
+                if rid in self._reply_cache:
+                    ok, data = self._reply_cache.pop(rid)
+                    if not ok:
+                        raise GpuServerError(
+                            f"gpu server error (ch={ch}): {data}")
+                    return data
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GpuServerError(
+                        f"gpu server timeout after {self.timeout_s:.0f}s "
+                        f"(ch={ch}, rid={rid})")
+                try:
+                    r_rid, ok, data = self.reply_q.get(
+                        timeout=remaining if step is None
+                        else min(step, remaining))
+                except Exception:
+                    r_rid = None
+                if r_rid is not None:
+                    if r_rid != rid:
+                        self._reply_cache[r_rid] = (ok, data)
+                        if len(self._reply_cache) > 128:
+                            # fail-loud：缓存膨胀 = 路由损坏，不可静默
+                            raise GpuServerError(
+                                "reply cache overflow — routing broken")
+                        continue
+                    if not ok:
+                        raise GpuServerError(
+                            f"gpu server error (ch={ch}): {data}")
+                    return data
+                # P17 spike：本步长内无回包 → 等待期窃取机会
+                if self._steal_cfg and ctx is not None \
+                        and not self._saw_sentinel:
+                    if deadline - time.monotonic() \
+                            > self._steal_cfg["guard_s"]:
+                        self._try_steal(ctx, stolen_here)
+        finally:
+            # stats 只记纯 GPU 等待（扣除本帧等待期窃取执行的时间）
+            gstats[0] += 1
+            gstats[1] += time.monotonic() - _t0 - stolen_here[0]
+
+    # ── P17 spike：异步流水（等待期任务窃取） ─────────────────────────
+
+    def arm_steal(self, task_q, active_slots, depth, wait_ms, guard_s):
+        """armed 后 _call_impl 的等待期开始窃取共享任务队列。"""
+        self._steal_cfg = {"depth": max(1, int(depth)),
+                           "wait_ms": max(1.0, float(wait_ms)),
+                           "guard_s": max(0.0, float(guard_s))}
+        self._task_q = task_q
+        self._active_slots = active_slots
+
+    def task_begin(self, kind):
+        # P17 spike：GPU 记账按任务 ctx 独立累计（嵌套窃取不重复计数）
+        ctx = {"kind": kind, "stolen": 0.0, "n_steal": 0,
+               "gpu": {ch: [0, 0.0] for ch in self.stats}}
+        self._ctx_stack.append(ctx)
+        if kind == "detect":
+            self._detect_open += 1
+            if self._detect_open > self.max_depth:
+                self.max_depth = self._detect_open
+        return ctx
+
+    def task_end(self, ctx):
+        if not self._ctx_stack or self._ctx_stack[-1] is not ctx:
+            raise RuntimeError("P17 ctx stack corrupted")
+        self._ctx_stack.pop()
+        if ctx["kind"] == "detect":
+            self._detect_open -= 1
+            # 有界暂存回填：detect 槽位释放时把封顶期暂存的 detect 任务
+            # 放回共享队列（其他 worker 或本端后续可领——不丢、不空转）
+            while self._stash:
+                self._task_q.put(self._stash.popleft())
+
+    def _try_steal(self, ctx, stolen_here):
+        if self._active_slots is not None \
+                and self._active_slots.value <= self.wid:
+            return  # 看门狗收缩槽位：让出，不偷
+        try:
+            task = self._task_q.get(timeout=0.05)
+        except Exception:
+            return
+        if task is None:
+            # 关停哨兵：原样放回（退出信号不吞），本端停止窃取
+            self._saw_sentinel = True
+            self._task_q.put(None)
+            return
+        if task["kind"] == "detect" \
+                and self._detect_open >= self._steal_cfg["depth"]:
+            # 有界：每 worker 在途 detect 页封顶（防内存膨胀）
+            self._stash.append(task)
+            return
+        t0 = time.monotonic()
+        try:
+            ctx["n_steal"] += 1
+            self._runner(task)
+        finally:
+            _d = time.monotonic() - t0
+            ctx["stolen"] += _d
+            stolen_here[0] += _d
+            self.steal_n += 1
+            self.steal_s += _d
 
     # ── 三通道 API（与既有单机函数同构） ────────────────────────────────
 

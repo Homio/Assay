@@ -30,23 +30,51 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 _log = logging.getLogger(__name__)
 
-# 单槽 fitz doc 缓存：同书任务连续到达时省一次 open（~10-30ms）。
-_DOC_CACHE = {"path": None, "doc": None}
+# P17 spike：多槽 fitz doc 缓存（LRU）+ 任务执行期 pin。
+# 单槽缓存在嵌套窃取下会 close 挂起任务正持有的 doc → "page is None"
+# （b10_a2_r1 实测 1176 次 → 重投循环 → 挂死）。修复：任务执行期 pin
+# 自己的 doc；淘汰只挑未 pin 槽位；全 pin 满载退化为不缓存直开。
+from collections import OrderedDict as _OrderedDict
+
+_DOC_CACHE = _OrderedDict()   # path -> doc（插入序 = LRU 冷端）
+_DOC_PINS = {}               # path -> pin 计数（同书嵌套可叠）
+_DOC_CAP = 16                # 每 worker 最多常开 16 本书的 doc
 
 
 def _open_doc(path: str):
     import fitz
-    if _DOC_CACHE["path"] == path:
-        return _DOC_CACHE["doc"]
-    if _DOC_CACHE["doc"] is not None:
+    doc = _DOC_CACHE.get(path)
+    if doc is not None:
+        _DOC_CACHE.move_to_end(path)
+        return doc
+    while len(_DOC_CACHE) >= _DOC_CAP:
+        victim = None
+        for p in _DOC_CACHE:
+            if not _DOC_PINS.get(p):
+                victim = p
+                break
+        if victim is None:
+            # 全部槽位被在途任务 pin 满载：不缓存直开，用毕随 GC。
+            return fitz.open(path)
         try:
-            _DOC_CACHE["doc"].close()
+            _DOC_CACHE.pop(victim).close()
         except Exception:
             pass
     doc = fitz.open(path)
-    _DOC_CACHE["path"] = path
-    _DOC_CACHE["doc"] = doc
+    _DOC_CACHE[path] = doc
     return doc
+
+
+def _pin_doc(path: str):
+    _DOC_PINS[path] = _DOC_PINS.get(path, 0) + 1
+
+
+def _unpin_doc(path: str):
+    n = _DOC_PINS.get(path, 0) - 1
+    if n > 0:
+        _DOC_PINS[path] = n
+    else:
+        _DOC_PINS.pop(path, None)
 
 
 def run_calib(task):
@@ -173,42 +201,39 @@ def run_build(task):
 
 
 def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
-                 active_slots, cfg, infer_q_csl=None):
+                active_slots, cfg, infer_q_csl=None):
     """
     Worker 进程入口。
 
     active_slots：mp.Value('i') —— 看门狗收缩/恢复的活跃槽位数。worker
     序号 ≥ 活跃槽位时让出 CPU（睡眠轮询），被收缩的槽位不取新任务；
     恢复后自动回到循环。哨兵 None → 退出。
-    """
-    import multiprocessing as mp
 
+    track_p5/P17 spike：async_pipeline=true 时 GpuClient armed 任务窃取
+    ——detect 任务等 GPU 回包超 async_wait_ms 即从共享 task_q 偷任务执行
+    （页上下文挂起/恢复由调用栈天然承载；detect 在途受 depth 封顶）。
+    任务执行统一走 _run_one（正常领取与被窃取同一条路径）。
+    """
     from assay.gpu_server import GpuClient
 
     logging.basicConfig(level=logging.WARNING)
     timeout_s = float(cfg.get("gpu_timeout_s", 60.0))
-    # track_p5：合并调用开关（scheduler worker_cfg 透传，源自
-    # pipeline_config.yaml gpu_server.fused_calls）。false = P3b 三通道
-    # 路径，逐位不变。
     fused_calls = bool(cfg.get("fused_calls", False))
-    # track_p5/p13b 拆分服务：cls/slanet/cslanet 请求走独立服务队列
-    #（None = 单服务 legacy，全部走 infer_q）。
     client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s,
                        infer_q_csl=infer_q_csl)
+    async_on = bool(cfg.get("async_pipeline", False))
+    if async_on:
+        client.arm_steal(task_q, active_slots,
+                         depth=int(cfg.get("async_depth", 2)),
+                         wait_ms=float(cfg.get("async_wait_ms", 50.0)),
+                         guard_s=float(cfg.get("async_guard_s", 10.0)))
 
-    while True:
-        # 槽位收缩：序号在槽外的 worker 睡眠让核（恒留 1 核 + 5GB 的
-        # 看门狗手段之一）
-        while active_slots.value <= worker_id:
-            time.sleep(0.5)
-        try:
-            task = task_q.get(timeout=1.0)
-        except Exception:
-            continue
-        if task is None:
-            break
+    def _run_one(task):
         kind = task["kind"]
-        g0 = {ch: tuple(v) for ch, v in client.stats.items()}
+        # P17 spike：执行期 pin 本书 doc —— 等待期嵌套窃取开别的书
+        # 也不会 close 本任务正持有的 doc（page/pix 生命周期保障）。
+        _pin_doc(task["path"])
+        ctx = client.task_begin(kind)
         t0 = time.time()
         try:
             if kind == "calib":
@@ -221,14 +246,42 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
                 out = run_build(task)
             else:
                 raise ValueError(f"unknown task kind {kind!r}")
-            gpu = {ch: [client.stats[ch][0] - g0[ch][0],
-                         client.stats[ch][1] - g0[ch][1]] for ch in g0}
+            # P17 spike：dt 扣除被窃取时间（Σdt 不重复计数）；GPU 记账
+            # 已按 ctx 独立累计（嵌套任务不重复计入本任务）。任务异常
+            # 照常回传 ok=False（调度器重投/失败），绝不静默补空。
             result_q.put({"task": task, "ok": True, "data": out,
-                          "dt": time.time() - t0, "gpu": gpu})
+                          "dt": time.time() - t0 - ctx["stolen"],
+                          "gpu": {ch: list(ctx["gpu"][ch])
+                                  for ch in ctx["gpu"]}})
         except Exception as e:  # noqa: BLE001
             _log.error(f"[W{worker_id:02d}] {kind} task failed: {e}\n"
                        f"{traceback.format_exc(limit=8)}")
-            gpu = {ch: [client.stats[ch][0] - g0[ch][0],
-                         client.stats[ch][1] - g0[ch][1]] for ch in g0}
             result_q.put({"task": task, "ok": False, "error": repr(e),
-                          "dt": time.time() - t0, "gpu": gpu})
+                          "dt": time.time() - t0 - ctx["stolen"],
+                          "gpu": {ch: list(ctx["gpu"][ch])
+                                  for ch in ctx["gpu"]}})
+        finally:
+            client.task_end(ctx)
+            _unpin_doc(task["path"])
+
+    if async_on:
+        client._runner = _run_one
+
+    while True:
+        while active_slots.value <= worker_id:
+            time.sleep(0.5)
+        try:
+            task = task_q.get(timeout=1.0)
+        except Exception:
+            continue
+        if task is None:
+            break
+        _run_one(task)
+
+    if async_on:
+        # P17 spike 画像：本 worker 窃取统计（退出时一次性打印）
+        print(f"[worker{worker_id:02d}] steal n={client.steal_n} "
+              f"s={client.steal_s:.1f} max_detect_depth={client.max_depth} "
+              f"stash_left={len(client._stash)} "
+              f"reply_cache_left={len(client._reply_cache)} "
+              f"sentinel_seen={client._saw_sentinel}", flush=True)

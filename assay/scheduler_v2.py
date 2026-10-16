@@ -553,6 +553,15 @@ class SchedulerV2:
             # track_p5：合并调用开关（gpu_server.fused_calls，默认
             # true；false = P3b 三通道路径逐位不变）。
             "fused_calls": bool(self.gpu_cfg.get("fused_calls", True)),
+            # track_p5/P17 spike：worker 异步流水（detect 等待期任务
+            # 窃取）。async_pipeline=false = 未 armed，逐位 legacy。
+            "async_pipeline": bool(self.gpu_cfg.get(
+                "async_pipeline", False)),
+            "async_depth": int(self.gpu_cfg.get("async_depth", 2)),
+            "async_wait_ms": float(self.gpu_cfg.get(
+                "async_wait_ms", 50.0)),
+            "async_guard_s": float(self.gpu_cfg.get(
+                "async_guard_s", 10.0)),
         }
         workers = []
         for i in range(self.num_workers):
@@ -602,6 +611,25 @@ class SchedulerV2:
                         self._fail_book(b, "scheduler deadlock detected")
 
         # ── 收尾 ──
+        # P18（条件4）：sentinel 前队列清空语义。主循环退出条件
+        # done_count == len(books) 已蕴含所有 book 终结（成功书全页
+        # terminal；失败书 pending 已清、迟到回包被 handle_result 幂等
+        # 忽略），此刻 task_q 残留只可能是已终结 book 的迟到死信任务
+        #（窃取/stash 交错产生）。drain 丢弃 = 哨兵必然进入已清空队列
+        #（语义显式化），避免退出路径的无意义执行；计数 > 0 即审计
+        # 信号（预期恒 0，spike 实测 stash_left/reply_cache_left 全零）。
+        # 失败重投天然有界（max_retries 硬上限），不选 deadline 方案
+        # 以免给纯计数语义引入墙钟非确定性。
+        drained = 0
+        try:
+            while True:
+                self.task_q.get_nowait()
+                drained += 1
+        except _queue.Empty:
+            pass
+        if drained:
+            print(f"[v2] tail drain: {drained} stale tasks dropped "
+                  f"before sentinels", flush=True)
         self._stop.set()
         for _ in workers:
             self.task_q.put(None)
