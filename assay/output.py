@@ -10,6 +10,7 @@ Coordinate system: all bbox values are in PDF points (native PDF units).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -782,6 +783,38 @@ def _build_grid_json(table: TableOutput) -> List[List[dict]]:
             })
         result.append(json_row)
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# P16: filesystem-safe output stems (Errno 36 — component > 255 bytes)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_NAME_MAX_BYTES = 255                    # Linux NAME_MAX: per-path-component byte limit
+_STEM_SUFFIX_ROOM = len("_layout.pdf")   # longest suffix appended to a book stem
+
+
+def safe_stem(stem: str,
+              max_bytes: int = _NAME_MAX_BYTES,
+              suffix_room: int = _STEM_SUFFIX_ROOM,
+              hash_len: int = 12) -> str:
+    """Filesystem-safe stem for derived output names ({stem}.md/.json/_layout.pdf).
+
+    Stems whose longest derived name still fits the 255-byte per-component
+    limit are returned byte-identically (normal short names never change).
+    Overlong stems are truncated at a UTF-8 character boundary and suffixed
+    with a short SHA-256 digest of the ORIGINAL full stem, so the mapping
+    stays unique (no collisions between same-prefix long titles) and
+    deterministic across runs (same input -> same output name).
+    """
+    budget = max_bytes - suffix_room
+    raw = stem.encode("utf-8")
+    if len(raw) <= budget:
+        return stem
+    digest = hashlib.sha256(raw).hexdigest()[:hash_len]
+    keep = budget - hash_len - 1            # 1 byte for the '~' separator
+    while keep > 0 and (raw[keep] & 0xC0) == 0x80:
+        keep -= 1                           # never split a multibyte character
+    return raw[:keep].decode("utf-8", "ignore") + "~" + digest
 
 
 def write_markdown(doc: DocumentOutput, path: str,

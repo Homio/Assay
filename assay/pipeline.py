@@ -79,7 +79,8 @@ def _process_one(args: Tuple[str, str, int, bool, bool, bool]) -> Dict:
     # (avoid reloading PP-LCNet + SLANet on every file).
     model = _get_worker_model(use_gpu=use_gpu)
     from assay.extractor import AssayExtractor
-    from assay.output import write_markdown, write_json, write_debug_pdf
+    from assay.output import (write_markdown, write_json,
+                               write_debug_pdf, safe_stem)
 
     file_stem = Path(pdf_path).stem
     start_time = time.time()
@@ -88,14 +89,15 @@ def _process_one(args: Tuple[str, str, int, bool, bool, bool]) -> Dict:
         extractor = AssayExtractor(model)
         doc = extractor.extract(pdf_path)
 
-        # Write output
-        out_dir = Path(output_dir) / file_stem
+        # Write output — P16: safe_stem guards >255-byte component names
+        safe = safe_stem(file_stem)
+        out_dir = Path(output_dir) / safe
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_markdown(doc, str(out_dir / f"{file_stem}.md"))
+        write_markdown(doc, str(out_dir / f"{safe}.md"))
         if not no_json:
-            write_json(doc, str(out_dir / f"{file_stem}.json"), indent=2)
+            write_json(doc, str(out_dir / f"{safe}.json"), indent=2)
         if debug_pdf:
-            debug_path = str(out_dir / f"{file_stem}_layout.pdf")
+            debug_path = str(out_dir / f"{safe}_layout.pdf")
             write_debug_pdf(doc, pdf_path, debug_path)
 
         elapsed = time.time() - start_time

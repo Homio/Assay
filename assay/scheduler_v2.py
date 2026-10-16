@@ -341,7 +341,7 @@ class SchedulerV2:
         book.finished = True
         from assay.output import (DocumentOutput, PageOutput,
                                   write_markdown, write_json,
-                                  write_debug_pdf)
+                                  write_debug_pdf, safe_stem)
         doc_out = DocumentOutput(file_name=book.stem)
         if failed:
             doc_out.status = book.status
@@ -352,14 +352,17 @@ class SchedulerV2:
             doc_out.texts.extend(book.texts.get(p, []))
             doc_out.tables.extend(book.tables.get(p, []))
 
-        out_dir = Path(self.output_dir) / book.stem
+        # P16: 组件名超 255 字节时截断 stem + 原始全名哈希后缀保唯一；
+        # 正常短名文档的输出名逐字节不变。doc_out.file_name 保留原始 stem。
+        safe = safe_stem(book.stem)
+        out_dir = Path(self.output_dir) / safe
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_markdown(doc_out, str(out_dir / f"{book.stem}.md"))
+        write_markdown(doc_out, str(out_dir / f"{safe}.md"))
         if not self.no_json:
-            write_json(doc_out, str(out_dir / f"{book.stem}.json"), indent=2)
+            write_json(doc_out, str(out_dir / f"{safe}.json"), indent=2)
         if self.debug_pdf:
             write_debug_pdf(doc_out, book.pdf_path,
-                            str(out_dir / f"{book.stem}_layout.pdf"))
+                            str(out_dir / f"{safe}_layout.pdf"))
 
         self.done_count += 1
         n_tables = len(doc_out.tables)
