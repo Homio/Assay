@@ -86,12 +86,6 @@ class _Book:
         self.scales: Dict[int, tuple] = {}
         self.tables: Dict[int, list] = {}
         self.pages_done = 0
-        # ── P19c 精确内容去重（track_p5）──
-        self.content_hash: str = ""             # 内容 SHA-256（预扫描填充）
-        self.shadow_of: Optional[int] = None    # 影子本：主本 book_id
-        self.shadows: List["_Book"] = []        # 主本：挂在名下的影子本
-        self.from_cache = False                 # 主本：由跨运行缓存装配
-        self.dedup_kind = ""                    # "" | "cache" | "shadow"
 
     def has_pending(self) -> bool:
         return any(self.pending[p] for p in self.pending)
@@ -130,19 +124,6 @@ class SchedulerV2:
         # 服务），各自独立 GIL/CUDA 上下文；默认 false = 单服务回退。
         self.split_servers = bool(self.gpu_cfg.get(
             "split_servers", False))
-
-        # ── P19c 精确内容去重（track_p5）──
-        ded = cfg.get("dedup") or {}
-        self.dedup_enabled = bool(ded.get("enabled", False))
-        self.dedup_cache_dir = str(ded.get("cache_dir") or "")
-        self.dedup_hash_workers = max(1, int(ded.get("hash_workers", 8)))
-        self.store = None                # DedupStore（presolve 时创建）
-        self._cached_payloads: Dict[int, dict] = {}  # 预扫描缓存命中载荷
-        self.dedup_stats: Dict[str, object] = {
-            "files": 0, "unique": 0, "dups": 0, "hash_s": 0.0,
-            "cache_hits": 0, "cache_hit_s": 0.0, "shadows": 0,
-            "shadow_assemble_s": 0.0, "sig": "",
-        }
 
         self.inflight_pages = 0
         self.inflight_crops = 0
@@ -241,12 +222,9 @@ class SchedulerV2:
 
     # ── 书注册与激活 ────────────────────────────────────────────────────
 
-    def add_books(self, pdf_paths: List[str],
-                  hashes: Optional[Dict[str, str]] = None):
+    def add_books(self, pdf_paths: List[str]):
         for i, p in enumerate(pdf_paths):
             self.books[i] = _Book(i, p)
-            if hashes is not None:
-                self.books[i].content_hash = hashes[p]
             self.queue_books.append(self.books[i])
 
     def _activate_books(self):
@@ -357,17 +335,15 @@ class SchedulerV2:
         book.t_end = time.time()
         self._finish_book(book, failed=True)
 
-    # ── P19c 精确内容去重：装配与复用 ─────────────────────────────
-
-    def _export_book(self, book: _Book) -> int:
-        """单本导出（md/json/debug_pdf）——自 _finish_book 原样抽出，
-        主本 / 影子本 / 缓存命中本共用同一条装配路径（输出等价性由
-        构造保证：同一提取载荷 + 同一导出代码 + 同名下 caption 注册）。"""
+    def _finish_book(self, book: _Book, failed: bool = False):
+        if book.finished:
+            return
+        book.finished = True
         from assay.output import (DocumentOutput, PageOutput,
                                   write_markdown, write_json,
                                   write_debug_pdf, safe_stem)
         doc_out = DocumentOutput(file_name=book.stem)
-        if book.status != "SUCCESS":
+        if failed:
             doc_out.status = book.status
             doc_out.error = book.error
         for p in range(book.n_pages):
@@ -387,168 +363,14 @@ class SchedulerV2:
         if self.debug_pdf:
             write_debug_pdf(doc_out, book.pdf_path,
                             str(out_dir / f"{safe}_layout.pdf"))
-        return len(doc_out.tables)
-
-    def _snapshot_payload(self, book: _Book) -> dict:
-        """原始提取载荷定格（深拷贝）+ 页眉 caption 信息捕捉。
-        只允许在导出变异之前调用（caption plan 会原地剥格/追加合成文本）。"""
-        import copy
-        from assay.detection import peek_statement_caption_info
-        return {
-            "content_hash": book.content_hash,
-            "n_pages": book.n_pages,
-            "page_dims": copy.deepcopy(book.page_dims),
-            "texts": copy.deepcopy(book.texts),
-            "tables": copy.deepcopy(book.tables),
-            "caption_info": peek_statement_caption_info(
-                book.pdf_path, book.n_pages),
-        }
-
-    def _store_put(self, book: _Book) -> None:
-        """完整成功结果原子落盘。引用即拍（pickle 序列化不修改对象，
-        且本调用先于导出变异）；失败只记账、绝不上抛——缓存写坏
-        不允许影响提取主流程，下次运行重算即可。"""
-        from assay.detection import peek_statement_caption_info
-        self.store.put(book.content_hash, {
-            "content_hash": book.content_hash,
-            "n_pages": book.n_pages,
-            "page_dims": book.page_dims,
-            "texts": book.texts,
-            "tables": book.tables,
-            "caption_info": peek_statement_caption_info(
-                book.pdf_path, book.n_pages),
-        })
-
-    def _complete_shadows(self, primary: _Book, payload: dict) -> None:
-        """主本终态传导：影子本逐个以主本提取结果装配自己的输出
-        （各自独立 stem / 输出目录 / 状态——复用结果，不删公告）。
-        主本成功 → 影子成功；主本显式失败 → 影子继承同一显式失败。"""
-        import copy
-        from assay.detection import register_statement_caption_info
-        t0 = time.time()
-        failed = primary.status != "SUCCESS"
-        for sh in primary.shadows:
-            sh.n_pages = payload["n_pages"]
-            sh.page_dims = copy.deepcopy(payload["page_dims"])
-            sh.texts = copy.deepcopy(payload["texts"])
-            sh.tables = copy.deepcopy(payload["tables"])
-            sh.status = primary.status
-            sh.error = primary.error
-            sh.ok = primary.ok
-            sh.dedup_kind = "shadow"
-            sh.t_start = sh.t_start or primary.t_start
-            sh.t_end = time.time()
-            if payload["caption_info"] is not None:
-                register_statement_caption_info(
-                    sh.pdf_path, sh.n_pages, payload["caption_info"])
-            self._finish_book(sh, failed=failed)
-        self.dedup_stats["shadow_assemble_s"] = \
-            float(self.dedup_stats["shadow_assemble_s"]) \
-            + (time.time() - t0)
-
-    def _complete_from_payload(self, book: _Book, payload: dict) -> None:
-        """缓存命中本：以历史完整成功载荷装配本运行的输出。"""
-        import copy
-        from assay.detection import register_statement_caption_info
-        book.n_pages = payload["n_pages"]
-        book.page_dims = copy.deepcopy(payload["page_dims"])
-        book.texts = copy.deepcopy(payload["texts"])
-        book.tables = copy.deepcopy(payload["tables"])
-        book.from_cache = True
-        book.dedup_kind = "cache"
-        book.t_start = book.t_end = time.time()
-        if payload["caption_info"] is not None:
-            register_statement_caption_info(
-                book.pdf_path, book.n_pages, payload["caption_info"])
-        self.dedup_stats["cache_hits"] = \
-            int(self.dedup_stats["cache_hits"]) + 1
-        self._finish_book(book)
-
-    def _dedup_presolve(self, pdf_paths: List[str]) -> None:
-        """预扫描：全量 SHA-256 → 主/影分组 → 缓存命中预载。
-
-        主本保持原始排序序（与去重关闭态的调度顺序一致）；影子本登记
-        进 books（计入 done 分母与输出装配）但不进任何工作队列——其
-        终态由主本 _finish_book 传导。缓存命中主本不进激活队列，在
-        worker/GPU 服务启动后、主循环开始前统一装配完结。"""
-        from assay import dedup as D
-        st = self.dedup_stats
-        t0 = time.time()
-        hashes = D.hash_files(pdf_paths, self.dedup_hash_workers)
-        st["hash_s"] = round(time.time() - t0, 2)
-        st["files"] = len(pdf_paths)
-        groups = D.group_by_hash(hashes)
-        st["unique"] = len(groups)
-        st["dups"] = len(pdf_paths) - len(groups)
-        if self.dedup_cache_dir:
-            self.store = D.DedupStore(
-                self.dedup_cache_dir, D.pipeline_signature(self.cfg))
-            st["sig"] = self.store.sig[:16]
-
-        # 主/影切分：同 hash 首个（排序序）为主本，其余为影子本
-        prim_paths: List[str] = []
-        prim_idx_of_hash: Dict[str, int] = {}
-        shadow_specs: List[tuple] = []          # (主本 book_id, 影子路径)
-        for p in pdf_paths:
-            h = hashes[p]
-            if h not in prim_idx_of_hash:
-                prim_idx_of_hash[h] = len(prim_paths)
-                prim_paths.append(p)
-            else:
-                shadow_specs.append((prim_idx_of_hash[h], p))
-        self.add_books(prim_paths, {p: hashes[p] for p in prim_paths})
-        for pi, p in shadow_specs:
-            sh = _Book(len(self.books), p)
-            sh.content_hash = hashes[p]
-            sh.shadow_of = pi          # 主本 book_id == prim_paths 序号
-            self.books[sh.book_id] = sh
-            self.books[pi].shadows.append(sh)
-        st["shadows"] = len(shadow_specs)
-
-        # 缓存命中预载（主循环启动前装配完结）
-        if self.store is not None:
-            t1 = time.time()
-            for i in range(len(prim_paths)):
-                payload = self.store.get(self.books[i].content_hash)
-                if payload is not None:
-                    self._cached_payloads[i] = payload
-            st["cache_hit_s"] = round(time.time() - t1, 2)
-        print(f"[dedup] prescan: {st['files']} files hashed in "
-              f"{st['hash_s']}s | {st['unique']} unique contents, "
-              f"{st['dups']} duplicates | store sig "
-              f"{st['sig'] or 'off'} | cache hits "
-              f"{len(self._cached_payloads)} ({st['cache_hit_s']}s)",
-              flush=True)
-
-    def _finish_book(self, book: _Book, failed: bool = False):
-        if book.finished:
-            return
-        book.finished = True
-        # ── P19c 去重钩子（顺序敏感：全部取数先于导出变异）──
-        # 1) 跨运行缓存落盘：主本成功、非缓存复用时，原始载荷原子提交
-        if (self.store is not None and not failed
-                and book.shadow_of is None and not book.from_cache):
-            self._store_put(book)
-        # 2) 影子装配源定格：导出会原地变异（剥格/追加合成文本），
-        #    深拷贝必须在导出前完成
-        shadow_payload = self._snapshot_payload(book) if book.shadows else None
-        # 3) 导出（原地变异）
-        n_tables = self._export_book(book)
-        # 4) 影子本逐个装配（各自独立输出目录与身份）
-        if shadow_payload is not None:
-            self._complete_shadows(book, shadow_payload)
 
         self.done_count += 1
+        n_tables = len(doc_out.tables)
         self.total_tables += n_tables
         if failed:
             self.fail_count += 1
             print(f"  [{self.done_count:3d}/{len(self.books)}] FAIL | "
                   f"{book.stem[:45]:45s} | {book.error[:60]}", flush=True)
-        elif book.dedup_kind:
-            print(f"  [{self.done_count:3d}/{len(self.books)}] "
-                  f"DEDUP:{book.dedup_kind:<6s} | "
-                  f"{book.stem[:45]:45s} | reuse  | "
-                  f"{n_tables:4d} tables", flush=True)
         else:
             dt = (book.t_end or time.time()) - (book.t_start or time.time())
             print(f"  [{self.done_count:3d}/{len(self.books)}] | "
@@ -722,11 +544,7 @@ class SchedulerV2:
         import queue as _queue
 
         t_start = time.time()
-        if self.dedup_enabled:
-            # P19c：精确内容去重（主/影分组 + 缓存预载）
-            self._dedup_presolve(pdf_paths)
-        else:
-            self.add_books(pdf_paths)
+        self.add_books(pdf_paths)
         self._activate_books()
 
         from assay.worker_v2 import worker_main
@@ -768,14 +586,6 @@ class SchedulerV2:
               f"(cuda:0)")
         print(f"  Files: {len(pdf_paths)} | Output: {self.output_dir}")
         print(f"{'='*60}", flush=True)
-
-        # P19c：缓存命中本统一装配完结（worker/GPU 已就位；done 分母
-        # 已含影子本与命中本，主循环退出条件天然正确）
-        if self._cached_payloads:
-            for bid in sorted(self._cached_payloads):
-                self._complete_from_payload(
-                    self.books[bid], self._cached_payloads[bid])
-            self._cached_payloads = {}
 
         idle_ticks = 0
         while self.done_count < len(self.books):
@@ -848,20 +658,6 @@ class SchedulerV2:
         print(f"  {self.total_tables} tables extracted")
         if self.gpu_restarts:
             print(f"  GPU server restarts: {self.gpu_restarts}")
-        if self.dedup_enabled:
-            st = self.dedup_stats
-            line = (f"  dedup: {st['unique']} unique / {st['files']} files "
-                    f"({st['dups']} duplicates) | prescan {st['hash_s']}s | "
-                    f"shadows {st['shadows']} "
-                    f"(assemble {st['shadow_assemble_s']:.1f}s) | "
-                    f"cache hits {st['cache_hits']}")
-            if self.store is not None:
-                line += (f" | store put {self.store.n_put} "
-                         f"(err {self.store.n_err}, "
-                         f"{self.store.put_bytes / 1048576:.0f}MiB)")
-            else:
-                line += " | store off"
-            print(line)
         print(f"  Wall time: {elapsed:.1f}s "
               f"({elapsed / max(1, total):.1f}s/file)")
         print(f"{'='*60}", flush=True)

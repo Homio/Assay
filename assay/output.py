@@ -60,12 +60,6 @@ def code_rev() -> str:
     return rev
 
 
-# P19c（track_p5）：导出格式签名——dedup 缓存命名空间的一个分量
-# （assay.dedup.pipeline_signature）。任何改变 md/json 导出布局的改动
-# 必须同步 bump 本常量，使历史缓存载荷整体失效（fail-toward-recompute）。
-EXPORT_FORMAT_SIG = "docling-export-v1"
-
-
 @dataclass
 class CellOutput:
     """A single cell in a parsed table."""
