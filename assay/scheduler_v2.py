@@ -117,6 +117,9 @@ class SchedulerV2:
         self.est_crops = int(budget.get("est_crops_per_page", 2))
         self.a_floor = max(2, int(self.a_floor_frac * self.num_workers))
         self.gpu_timeout_s = float(sched.get("gpu_timeout_s", 60.0))
+        # P25 B1：页数感知激活阀门——活跃书总页数达上限即暂停激活新书
+        #（大书自然低并发；<=0 关闭阀门退回纯书数口径）。
+        self.max_active_pages = int(sched.get("max_active_pages", 1500))
 
         self.wd_cfg = wd
         self.gpu_cfg = cfg.get("gpu_server") or {}
@@ -199,7 +202,10 @@ class SchedulerV2:
                 target=gpu_server_main,
                 args=(q, self.heartbeat, self.reply_queues,
                       dict(self.gpu_cfg), serve),
-                name=name, daemon=False)
+                # P25 A4：孤儿免疫——daemon=True 父进程正常退出即收
+                # 编；kill -9 场景由进程内 ppid==1 自检兜底退出
+                #（gpu_server 派发主循环每次心跳前检查）。
+                name=name, daemon=True)
             p.start()
             self.gpu_procs.append(p)
             _log.info("[v2] gpu server %s spawned (pid %s)", name, p.pid)
@@ -227,9 +233,17 @@ class SchedulerV2:
             self.books[i] = _Book(i, p)
             self.queue_books.append(self.books[i])
 
+    def _active_pages(self) -> int:
+        return sum(b.n_pages for b in self.active)
+
     def _activate_books(self):
         import fitz
         while self.queue_books and len(self.active) < self.max_active_books:
+            # P25 B1：页数感知阀门——活跃总页数达上限即停止激活；
+            # active 为空时必然放行第一本（单本超大不致死锁）。
+            if (self.max_active_pages > 0 and self.active
+                    and self._active_pages() >= self.max_active_pages):
+                break
             book = self.queue_books.popleft()
             try:
                 doc = fitz.open(book.pdf_path)
@@ -417,8 +431,15 @@ class SchedulerV2:
     def _handle_detect(self, book: _Book, res: dict):
         data = res["data"]
         p = res["task"]["page_idx"]
-        # crop 预算校正：派发时按 est 占用，此处换成实际 crop 数；
-        # build 完成时再释放（见 _handle_build）
+        # 已知账目 bug（HEAD 既有，P25 不修）：`+= actual - est` 与
+        # _decrement 的 `-est` 重复扣减 → inflight_crops 单边负漂
+        #（p25_freeze200 实测 900s 漂到 -36964），crop 预算门因此不
+        # 再真实收紧。修正为 `+= actual` 语义更准，但会改变 dispatch
+        # 交错——p25b13 gate 实测计数层 regressions 23→24（燕京啤酒
+        # p86 gt#0 cov 0.89→0.78 边缘翻转，F1 不变），违反本单
+        # 「regressions=23 逐字一致」验收口径，故按边界纪律保持
+        # HEAD 原样、另行上报 CTO 决策。A1 防闩锁不依赖账目精确性
+        #（停更指纹判据对漂移免疫）。
         actual = int(data["n_crops"])
         self.inflight_crops += actual - self.est_crops
         if data["pairs"]:
@@ -492,7 +513,30 @@ class SchedulerV2:
         load_pause = float(cfg.get("loadavg_pause", 19.0))
         stale_s = float(cfg.get("heartbeat_stale_s", 3.0))
         grace_s = float(cfg.get("startup_grace_s", 180.0))
+        # P25 A1：防闩锁探测恢复——pause 置位且在制完全清空持续超过
+        # probe_resume_s 秒 → 无条件 clear 试发。根因：被 pause 的
+        # worker 不释放 fitz 缓存 / pymalloc 高水位 / CUDA host 内存，
+        # MemAvailable 可能永远回不到 resume 阈值（闩锁）。一级页/crop
+        # 预算仍是限流器；水位真低下一个 tick 会重新 pause。
+        probe_resume_s = float(cfg.get("probe_resume_s", 30.0))
+        # P25 A1 加强：停更指纹窗口。p25_freeze200_final 实测：pause
+        # 时 inflight_pages 已归零，但 118 个 crop 搁浅在共享偷活队列
+        #（worker 被 pause 不再偷活 → 回包永不发生）→ inflight_crops
+        # 永不归零 → 「双计数清零」条件永假 → 闩锁复现（done 卡
+        # 11/200 达 8 分钟）。补第二判据：(pages, crops, done) 三元组
+        # 在 pause 期间停更超过 stall_resume_s 秒 = 在制搁浅，
+        # 同样无条件 clear 试发（cleared 后 worker 恢复偷活，搁浅
+        # crop 自然完成并回补计数）。真处理中的在制会让指纹持续
+        # 变化，不会误触。
+        stall_resume_s = float(cfg.get("stall_resume_s", 60.0))
+        # P25 A6：可观测性——周期状态行 + pause 超长 latch 报警。
+        status_interval_s = float(cfg.get("status_interval_s", 60.0))
+        latch_suspect_s = float(cfg.get("latch_suspect_s", 120.0))
         resume_since: Optional[float] = None
+        pause_since: Optional[float] = None
+        stall_fp: Optional[tuple] = None
+        stall_fp_since: float = 0.0
+        last_status = time.monotonic()
         last_heartbeat = self.heartbeat.value
 
         while not self._stop.is_set():
@@ -528,6 +572,61 @@ class SchedulerV2:
                                   self.num_workers)
                     resume_since = None
 
+            # pause 持续时长计时（跃迁维护，供 A1/A6 使用）
+            if self.pause_evt.is_set():
+                if pause_since is None:
+                    pause_since = time.monotonic()
+            else:
+                pause_since = None
+
+            # P25 A1：防闩锁探测恢复（双判据：清零 或 停更指纹超窗）
+            if pause_since is not None:
+                held = time.monotonic() - pause_since
+                fp = (self.inflight_pages, self.inflight_crops,
+                      self.done_count)
+                if fp != stall_fp:
+                    stall_fp = fp
+                    stall_fp_since = time.monotonic()
+                inflight_empty = (self.inflight_pages == 0
+                                  and self.inflight_crops == 0)
+                frozen = time.monotonic() - stall_fp_since
+                if ((inflight_empty and held >= probe_resume_s)
+                        or (held >= probe_resume_s
+                            and frozen >= stall_resume_s)):
+                    _log.warning("[watchdog] anti-latch probe: pause "
+                                 "held %.0fs (inflight %s, fingerprint "
+                                 "frozen %.0fs) — force resume attempt",
+                                 held,
+                                 "empty" if inflight_empty
+                                 else f"crops={self.inflight_crops}",
+                                 frozen)
+                    self.pause_evt.clear()
+                    pause_since = None
+                    resume_since = None
+            else:
+                stall_fp = None
+
+            # P25 A6：周期状态行；pause 超长 → ERROR latch suspected
+            now = time.monotonic()
+            if now - last_status >= status_interval_s:
+                last_status = now
+                paused_for = (now - pause_since
+                              if pause_since is not None else 0.0)
+                msg = ("[watchdog] status mem=%.0fMiB load1=%.1f "
+                       "slots=%d/%d paused=%s(%.0fs) inflight_pages=%d "
+                       "inflight_crops=%d done=%d/%d"
+                       % (mem_mib, load1, self.active_slots.value,
+                          self.num_workers, self.pause_evt.is_set(),
+                          paused_for, self.inflight_pages,
+                          self.inflight_crops, self.done_count,
+                          len(self.books)))
+                if paused_for > latch_suspect_s:
+                    _log.error("%s — latch suspected", msg)
+                # print 直出：包装脚本（run_p23_wrapper 等）不配 logging
+                # 时 _log.info 不可见——A6 的意义就是僵死不静默，
+                # 状态行必须无条件可见。
+                print(msg, flush=True)
+
             hb = self.heartbeat.value
             if hb != last_heartbeat:
                 last_heartbeat = hb
@@ -547,6 +646,7 @@ class SchedulerV2:
         self.add_books(pdf_paths)
         self._activate_books()
 
+        sched = self.cfg.get("scheduler") or {}
         from assay.worker_v2 import worker_main
         worker_cfg = {
             "gpu_timeout_s": self.gpu_timeout_s,
@@ -562,6 +662,14 @@ class SchedulerV2:
                 "async_wait_ms", 50.0)),
             "async_guard_s": float(self.gpu_cfg.get(
                 "async_guard_s", 10.0)),
+            # P25 A3：worker 内存治理——MuPDF store 限额（死配置接线）
+            # 与 fitz doc LRU 缓存槽位上限（16→8）。
+            "worker_store_mb": int(sched.get("worker_store_mb", 0)),
+            "doc_cache_cap": int(sched.get("worker_doc_cache_cap", 8)),
+            # P25 A2：pause 主动释放——worker 空转遇 pause 清空 doc
+            # 缓存 + malloc_trim，让 pause 真正降水位。
+            "release_on_pause": bool(self.wd_cfg.get(
+                "release_on_pause", True)),
         }
         workers = []
         for i in range(self.num_workers):
@@ -570,8 +678,11 @@ class SchedulerV2:
                                        self.infer_q, self.reply_queues[i],
                                        self.active_slots, worker_cfg,
                                        self.infer_q_csl
-                                       if self.split_servers else None),
-                                 name=f"worker-{i:02d}", daemon=False)
+                                       if self.split_servers else None,
+                                       self.pause_evt),
+                                 # P25 A4：孤儿免疫——daemon=True；kill -9
+                                 # 场景由 worker 主循环 ppid==1 自检兜底。
+                                 name=f"worker-{i:02d}", daemon=True)
             p.start()
             workers.append(p)
         self._spawn_gpu_server()
@@ -688,7 +799,27 @@ def run_v2(pdf_dir: str, output_dir: str, num_workers: int,
         print("Error: no PDF files found")
         return 0.0
     cfg = load_pipeline_config()
-    sched = SchedulerV2(output_dir=output_dir,
-                        num_workers=num_workers, no_json=no_json,
-                        debug_pdf=debug_pdf, cfg=cfg)
-    return sched.run([str(p) for p in pdfs])
+    # P25 A5：单实例锁——flock 锁文件（进程消亡内核自动释放，无
+    # stale 问题），已锁即报错退出，杜绝多实例并发触发内存闩锁
+    #（19:06/19:07 重复启动事故的直接防护）。锁文件勿放 NFS。
+    lock_path = str((cfg.get("scheduler") or {}).get(
+        "instance_lock_file", "/tmp/assay_v2_pipeline.lock"))
+    import fcntl
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        print(f"Error: another Assay v2 pipeline instance is already "
+              f"running (lock: {lock_path}) — refusing to start")
+        raise SystemExit(2)
+    os.ftruncate(lock_fd, 0)
+    os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
+    try:
+        sched = SchedulerV2(output_dir=output_dir,
+                            num_workers=num_workers, no_json=no_json,
+                            debug_pdf=debug_pdf, cfg=cfg)
+        return sched.run([str(p) for p in pdfs])
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)

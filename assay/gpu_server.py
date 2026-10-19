@@ -44,6 +44,23 @@ class GpuServerError(RuntimeError):
     """GPU 服务端在执行批次时抛出的异常（透传给 worker 的任务重试层）。"""
 
 
+def _enable_pdeathsig():
+    """P25 A4：孤儿免疫的内核级兜底 —— PR_SET_PDEATHSIG(SIGKILL)。
+
+    派发主循环的 ppid 轮询只覆盖 0.02s 超时的取请求点；父进程死亡
+    时若本进程卡在别的阻塞点（通道线程 join / 满管道回包等）就永远
+    收不到 ppid 轮询。PDEATHSIG 让内核在父进程死亡瞬间直接收割本
+    进程，释放模型 + CUDA 驻留（~10GB/代）。与 worker_v2 同款。"""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, 9)  # PR_SET_PDEATHSIG=1, SIGKILL=9
+        if os.getppid() == 1:
+            os._exit(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
                     serve_channels=None) -> None:
     """
@@ -61,6 +78,7 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
         cfg:        pipeline_config.yaml['gpu_server'] 段（dict）。
     """
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    _enable_pdeathsig()
     import numpy as np
 
     # tqdm 进度条在服务循环里每批打一行 stderr —— UI 噪音，不影响算法。
@@ -610,6 +628,12 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
     # 派发线程（主循环）：只做路由 + 心跳
     while not exit_seen:
         heartbeat.value = time.time()
+        # P25 A4：孤儿免疫——调度器被 kill -9 后本进程被 init 收编
+        #（ppid==1），立即退出释放模型/CUDA 驻留（~10GB/代）。
+        if os.getppid() == 1:
+            _log.warning("[gpu-server] parent dead (ppid=1) — exiting")
+            exit_seen = True
+            break
         while True:
             try:
                 req = infer_q.get(timeout=0.02)

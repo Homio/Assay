@@ -56,12 +56,15 @@ gpu_server:
   async_guard_s: 10
 
 scheduler:
-  worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）
+  worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）；P25 A3 起真正接线
+  worker_doc_cache_cap: 8    # P25 A3：worker fitz doc LRU 缓存槽位上限（原 16）
   calib_chunk_pages: 32      # 页眉校准扫描分片大小（页/任务）
   a_floor_fraction: 0.25     # A 类（文本）在制保底占比（×worker 数）
   max_task_retries: 2        # 单任务失败重投上限（GPU 超时/瞬时错误）
   gpu_timeout_s: 60.0        # worker 单次 GPU 请求等待上限
   max_active_books: 50       # 同时开工的书上限（其余排队）
+  max_active_pages: 1500     # P25 B1：活跃书总页数阀门（大书自然低并发；0=关闭）
+  instance_lock_file: /tmp/assay_v2_pipeline.lock  # P25 A5：单实例 flock（勿放 NFS）
 
 budgets:
   # 页预算调度器：在制页 ≤256、在制 crop ≤512、在制书 ≤50。
@@ -80,3 +83,8 @@ watchdog:
   loadavg_pause: 19.0        # load1 超过此值暂停扩槽（保 1 核余量）
   heartbeat_stale_s: 3.0     # GPU 服务心跳过期秒数 → 判定降级并重启
   startup_grace_s: 180.0     # GPU 服务启动（模型加载）期内心跳豁免时长
+  probe_resume_s: 30.0       # P25 A1：pause 置位且在制清空持续该秒数 → 强制 clear 试发（防闩锁）
+  stall_resume_s: 60.0       # P25 A1 加强：(pages,crops,done) 指纹停更超该秒数（搁浅在制）→ 同样强制 clear 试发
+  latch_suspect_s: 120.0     # P25 A6：pause 持续超该秒数打 ERROR "latch suspected"
+  status_interval_s: 60.0    # P25 A6：watchdog 周期状态行间隔
+  release_on_pause: true     # P25 A2：worker 空转遇 pause 清 doc 缓存 + malloc_trim 主动降水位

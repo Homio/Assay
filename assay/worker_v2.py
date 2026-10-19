@@ -38,7 +38,47 @@ from collections import OrderedDict as _OrderedDict
 
 _DOC_CACHE = _OrderedDict()   # path -> doc（插入序 = LRU 冷端）
 _DOC_PINS = {}               # path -> pin 计数（同书嵌套可叠）
-_DOC_CAP = 16                # 每 worker 最多常开 16 本书的 doc
+# P25 A3：缓存槽位上限由 worker_main 按 pipeline_config.yaml
+#（scheduler.worker_doc_cache_cap）覆盖；模块默认仅兜底。
+_DOC_CAP = 16                # 每 worker 最多常开的 doc 数
+
+
+def _enable_pdeathsig():
+    """P25 A4：孤儿免疫的内核级兜底 —— PR_SET_PDEATHSIG(SIGKILL)。
+
+    主循环 ppid 轮询只覆盖取任务空转点；p25_freeze200_final 实测：
+    调度器被杀后 worker 常卡在 mp 队列的 futex（满管道 put /
+    队列锁）里，永远回不到轮询点（20 个 worker 仅 1 个因 GPU 超时
+    异常解锁而退出，19 个驻留各 ~1GB）。PDEATHSIG 让内核在父进程
+    死亡瞬间直接收割本进程，对任何阻塞点免疫。prctl 后立刻自检
+    ppid，防父进程在 prctl 前已死的竞态（此时 ppid 已是 1）。"""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, 9)  # PR_SET_PDEATHSIG=1, SIGKILL=9
+        if os.getppid() == 1:
+            os._exit(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _flush_doc_cache():
+    """P25 A2：pause 主动释放——关闭全部未 pin 的缓存 doc、GC、
+    malloc_trim（pymalloc arena 高水位还给 OS），让 watchdog pause
+    真正降水位。仅关未 pin 槽位（被窃取嵌套任务持有的 doc 不动）。"""
+    import gc
+    for _p in list(_DOC_CACHE):
+        if not _DOC_PINS.get(_p):
+            try:
+                _DOC_CACHE.pop(_p).close()
+            except Exception:  # noqa: BLE001
+                pass
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _open_doc(path: str):
@@ -201,7 +241,7 @@ def run_build(task):
 
 
 def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
-                active_slots, cfg, infer_q_csl=None):
+                active_slots, cfg, infer_q_csl=None, pause_evt=None):
     """
     Worker 进程入口。
 
@@ -213,10 +253,24 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
     ——detect 任务等 GPU 回包超 async_wait_ms 即从共享 task_q 偷任务执行
     （页上下文挂起/恢复由调用栈天然承载；detect 在途受 depth 封顶）。
     任务执行统一走 _run_one（正常领取与被窃取同一条路径）。
+
+    P25 A2/A4：pause_evt 置位且空转时清 doc 缓存主动降水位；主循环
+    检测 os.getppid()==1（父进程被 kill -9 收编为孤儿）即退出，
+    杜绝孤儿舰队驻留内存。
     """
     from assay.gpu_server import GpuClient
 
+    _enable_pdeathsig()
     logging.basicConfig(level=logging.WARNING)
+    # P25 A3：死配置接线——MuPDF store 限额（worker_store_mb MB，
+    # 0 = 不动）；doc LRU 缓存槽位上限。
+    global _DOC_CAP
+    _DOC_CAP = max(1, int(cfg.get("doc_cache_cap", _DOC_CAP)))
+    store_mb = int(cfg.get("worker_store_mb", 0))
+    if store_mb > 0:
+        import fitz
+        fitz.TOOLS.store_maxsize = store_mb << 20
+    release_on_pause = bool(cfg.get("release_on_pause", False))
     timeout_s = float(cfg.get("gpu_timeout_s", 60.0))
     fused_calls = bool(cfg.get("fused_calls", False))
     client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s,
@@ -267,12 +321,31 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
     if async_on:
         client._runner = _run_one
 
+    flushed_on_pause = False
     while True:
+        # P25 A4：孤儿免疫——父进程被 kill -9 后本进程被 init 收编
+        #（ppid==1），立即退出，杜绝孤儿舰队（~10GB/代 驻留）。
+        if os.getppid() == 1:
+            _log.warning("[W%02d] parent dead (ppid=1) — exiting",
+                         worker_id)
+            break
         while active_slots.value <= worker_id:
+            if os.getppid() == 1:
+                _log.warning("[W%02d] parent dead (ppid=1) — exiting",
+                             worker_id)
+                return
             time.sleep(0.5)
         try:
             task = task_q.get(timeout=1.0)
         except Exception:
+            # P25 A2：空转遇 pause → 主动释放（每次 pause  episode 一次，
+            # pause 解除后复位）。
+            if pause_evt is not None and pause_evt.is_set():
+                if release_on_pause and not flushed_on_pause:
+                    _flush_doc_cache()
+                    flushed_on_pause = True
+            else:
+                flushed_on_pause = False
             continue
         if task is None:
             break
