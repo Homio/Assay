@@ -109,6 +109,7 @@ class SchedulerV2:
         self.num_workers = max(2, num_workers if (num_workers or 0) > 1
                                else workers_cfg)
         self.calib_chunk = max(1, int(sched.get("calib_chunk_pages", 32)))
+        self.seed_ug_span = bool(sched.get("worker_seed_ug_span", False))
         self.a_floor_frac = float(sched.get("a_floor_fraction", 0.25))
         self.max_retries = int(sched.get("max_task_retries", 2))
         self.max_active_books = int(sched.get("max_active_books", 50))
@@ -265,6 +266,7 @@ class SchedulerV2:
                     "kind": "calib", "book": book.book_id,
                     "path": book.pdf_path, "page_lo": lo,
                     "page_hi": hi, "chunk_id": c, "retry": 0,
+                    **({"ug_spans": True} if self.seed_ug_span else {}),
                 })
             self.active.append(book)
             _log.info("[v2] book activated: %s (%d pages, %d calib chunks)",
@@ -405,6 +407,13 @@ class SchedulerV2:
             # statement_caption_info 的 _file_stem 匹配口径一致
             book.header_sigs = register_header_calibration(
                 book.pdf_path, book.n_pages, book.calib_partials)
+            if self.seed_ug_span:
+                from assay.rulings import double_span_threshold
+                spans = []
+                for part in sorted(book.calib_partials,
+                                   key=lambda p: p["page_no"]):
+                    spans.extend(part["ug_spans"])
+                book.ug_span_thr = double_span_threshold(spans)
             book.calib_partials = []
             for p in range(book.n_pages):
                 book.pending[PRIO_TEXT].append({
@@ -424,6 +433,8 @@ class SchedulerV2:
                 "kind": "detect", "book": book.book_id,
                 "path": book.pdf_path, "page_idx": p,
                 "header_sigs": book.header_sigs, "retry": 0,
+                **({"ug_span_thr": book.ug_span_thr}
+                   if self.seed_ug_span else {}),
             })
         else:
             self._page_terminal(book)
@@ -666,6 +677,14 @@ class SchedulerV2:
             # 与 fitz doc LRU 缓存槽位上限（16→8）。
             "worker_store_mb": int(sched.get("worker_store_mb", 0)),
             "doc_cache_cap": int(sched.get("worker_doc_cache_cap", 8)),
+            # P29：worker 页眉校准缓存由调度器 header_sigs 预置（免整本重扫）。
+            "seed_header_sigs": bool(sched.get("worker_seed_header_sigs",
+                                               False)),
+            # P29b：worker 内 page.get_text("dict") 按 Page 对象记忆化。
+            "textpage_memo": bool(sched.get("worker_textpage_memo", False)),
+            # P30：同一 Page 同选项同 clip 的 get_text 记忆化（需 textpage_memo）。
+            "textpage_memo_clip": bool(sched.get("worker_textpage_memo_clip",
+                                                 False)),
             # P25 A2：pause 主动释放——worker 空转遇 pause 清空 doc
             # 缓存 + malloc_trim，让 pause 真正降水位。
             "release_on_pause": bool(self.wd_cfg.get(

@@ -23,6 +23,7 @@ gpu_server:
   yolo_window_ms: 0          # yolo 无真批，到即执行
   cls_window_ms: 3           # cls 单图 ~0.18ms，窗口只为聚合并发请求
   slanet_window_ms: 5        # slanet 跨页聚合凑批（engine batch_size 真批）
+  slanet_lanes: 2            # track_p5/P31：slanet 通道执行 lane 数（每 lane 独立 ORT 会话，整日实测显存 +5~7GB/lane；1=原单线程行为）
   slow_batch_ms: 2000        # 单批超过该耗时打 WARN 日志
   # ── track_p5：合并调用通道（detect 任务 GPU 往返 5 跳 → 2 跳）────────
   # 总开关：false 时 worker 走 P3b 三通道路径，逐位不变（legacy 回退）。
@@ -45,13 +46,21 @@ gpu_server:
   cslanet_window_ms: 350     # track_p5: 凑满48窗口（到达率~40crops/s时批~35-48）
   exec_debug: false           # track_p5: 通道执行分解计时（诊断开关，默认 false）
   split_servers: true        # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
+  # ── track_p5/P27：SLANet 解码器 torch CUDA Graph 化 ──
+  # false = legacy 整图 ORT（含 Loop）；true = 编码器 ORT + 解码 Loop 由
+  # torch 单步 CUDA Graph 逐步回放（全 FP32：TF32 非批不变会翻近平票 token；逐步判停与 ORT 同步），
+  # 任何异常自动回退原 ORT 会话。
+  slanet_torch_decoder: false
+  slanet_decoder_slots: [32, 48]   # 预捕获的固定批尺寸（须 ≥ slanet/cslanet_batch_max）
+  slanet_decoder_max_steps: 500    # 解码步上限 assign_0（Loop 步 0..500 含端点，至多 501 步）
+  slanet_decoder_tf32: false     # 解码器 TF32（false=精密 FP32；true=对齐 ORT 默认 TF32 精度）
   # ── track_p5/P17 spike：worker 异步流水（detect 等待期任务窃取） ──
   # false = 未 armed 逐位 legacy；true 后 GPU 回包等待超 async_wait_ms
   # 即从共享任务队列窃取任务执行（text/build/calib 任意，detect 受
   # async_depth 每 worker 在途上限封顶；剩余超时预算 < async_guard_s
   # 不偷，防超时误杀）。
   async_pipeline: true
-  async_depth: 2
+  async_depth: 4             # P31：配合 slanet_lanes=2 加深在途凑批（500 本 197.9→159.4s；原值 2）
   async_wait_ms: 50
   async_guard_s: 10
 
@@ -59,6 +68,10 @@ scheduler:
   worker_store_mb: 64        # track_p5：worker MuPDF store 限额 MB（0=不改）；P25 A3 起真正接线
   worker_doc_cache_cap: 8    # P25 A3：worker fitz doc LRU 缓存槽位上限（原 16）
   calib_chunk_pages: 32      # 页眉校准扫描分片大小（页/任务）
+  worker_seed_ug_span: true       # P29c：双下划线阈值随 calib 分片逐页采集、调度器合并后预置 worker（免每 worker 整本矢量重扫；false=原行为）
+  worker_textpage_memo: true      # P29b：worker 内同一 Page 的 get_text("dict") 只抽一次（false=原行为）
+  worker_textpage_memo_clip: false  # P30：同一 Page 同选项同 clip 的 get_text(dict/rawdict/text) 只抽一次（需 worker_textpage_memo；false=原行为）
+  worker_seed_header_sigs: true   # P29：detect 任务用调度器已算的 header_sigs 预置 worker 校准缓存（免每 worker 整本重扫；false=原行为）
   a_floor_fraction: 0.25     # A 类（文本）在制保底占比（×worker 数）
   max_task_retries: 2        # 单任务失败重投上限（GPU 超时/瞬时错误）
   gpu_timeout_s: 60.0        # worker 单次 GPU 请求等待上限

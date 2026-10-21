@@ -122,7 +122,11 @@ def run_calib(task):
     doc = _open_doc(task["path"])
     partials = []
     for i in range(task["page_lo"], min(task["page_hi"], len(doc))):
-        partials.append(calibrate_page_headers_scan_page(doc[i]))
+        part = calibrate_page_headers_scan_page(doc[i])
+        if task.get("ug_spans"):
+            from assay.rulings import double_span_scan_page
+            part["ug_spans"] = double_span_scan_page(doc[i])
+        partials.append(part)
     return partials
 
 
@@ -138,7 +142,7 @@ def run_text(task):
             "cand": bool(cand)}
 
 
-def run_detect(task, client, fused_calls=False):
+def run_detect(task, client, fused_calls=False, seed_header_sigs=False):
     import fitz
     import numpy as np
     from assay.detection import (
@@ -146,6 +150,19 @@ def run_detect(task, client, fused_calls=False):
     from assay.extractor import (PAGE_ZOOM, GATEKEEPER_THRESHOLD,
                                  prepare_page_slanet_data)
     doc = _open_doc(task["path"])
+    if seed_header_sigs and task.get("header_sigs") is not None:
+        # _trim_page_headers 经 calibrate_page_headers(doc) 取页眉签名；
+        # worker 进程缓存为空时会整本重扫。调度器已用同一扫描函数、
+        # 同一 doc 算出 header_sigs（register_header_calibration），
+        # 以同键 (doc.name, len(doc)) 预置即逐位等价。
+        from assay.detection import _hdr_sig_cache
+        _hdr_sig_cache.setdefault((doc.name, len(doc)),
+                                  set(task["header_sigs"]))
+    if "ug_span_thr" in task:
+        # 双下划线阈值同理：调度器由 calib 分片的逐页 spans 按页序合并
+        # （double_span_threshold），与 calibrate_double_span(doc) 同算术。
+        from assay.rulings import _ug_span_cache
+        _ug_span_cache.setdefault((doc.name, len(doc)), task["ug_span_thr"])
     page = doc[task["page_idx"]]
     pix = page.get_pixmap(matrix=fitz.Matrix(PAGE_ZOOM, PAGE_ZOOM))
 
@@ -273,6 +290,11 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
     release_on_pause = bool(cfg.get("release_on_pause", False))
     timeout_s = float(cfg.get("gpu_timeout_s", 60.0))
     fused_calls = bool(cfg.get("fused_calls", False))
+    seed_header_sigs = bool(cfg.get("seed_header_sigs", False))
+    if cfg.get("textpage_memo", False):
+        from assay import textpage_memo
+        textpage_memo.install(
+            clip=bool(cfg.get("textpage_memo_clip", False)))
     client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s,
                        infer_q_csl=infer_q_csl)
     async_on = bool(cfg.get("async_pipeline", False))
@@ -295,7 +317,8 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
             elif kind == "text":
                 out = run_text(task)
             elif kind == "detect":
-                out = run_detect(task, client, fused_calls=fused_calls)
+                out = run_detect(task, client, fused_calls=fused_calls,
+                                 seed_header_sigs=seed_header_sigs)
             elif kind == "build":
                 out = run_build(task)
             else:

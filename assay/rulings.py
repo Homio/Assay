@@ -474,11 +474,21 @@ def calibrate_double_span(doc) -> Optional[float]:
 
     spans: List[float] = []
     for page in doc:
-        H, V = extract_line_segments(page)
-        vb = _value_band_clusters(H, V)
-        if vb is not None:
-            spans.extend(_double_span(c) for c in vb[2])
+        spans.extend(double_span_scan_page(page))
+    thr = double_span_threshold(spans)
+    _ug_span_cache[key] = thr
+    return thr
 
+
+def double_span_scan_page(page) -> List[float]:
+    """Per-page body of calibrate_double_span: this page's cluster spans."""
+    H, V = extract_line_segments(page)
+    vb = _value_band_clusters(H, V)
+    return [_double_span(c) for c in vb[2]] if vb is not None else []
+
+
+def double_span_threshold(spans: List[float]) -> Optional[float]:
+    """Book-level merge of calibrate_double_span (spans in page order)."""
     thr: Optional[float] = None
     if len(spans) >= UG_CALIB_MIN_CLUSTERS:
         hist: Dict[float, int] = {}
@@ -495,8 +505,6 @@ def calibrate_double_span(doc) -> Optional[float]:
                 doubles = sum(1 for s in spans if s >= hi - 0.125)
                 if doubles >= UG_CALIB_MIN_DOUBLES and singles >= doubles:
                     thr = (lo + hi) / 2
-
-    _ug_span_cache[key] = thr
     return thr
 
 

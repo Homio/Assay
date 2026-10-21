@@ -44,6 +44,33 @@ class GpuServerError(RuntimeError):
     """GPU 服务端在执行批次时抛出的异常（透传给 worker 的任务重试层）。"""
 
 
+def _req_size(ch, req) -> int:
+    """单请求在通道配额口径下的计数（cls/slanet 按图，cslanet 按 crop，yolo 按页）。"""
+    if ch in ("cls", "slanet"):
+        return len(req["payload"])
+    if ch == "cslanet":
+        return len(req["payload"]["crops"])
+    return 1
+
+
+def _drain(buf, ch, quota, lock):
+    """从通道缓冲按配额取一批（至少 1 个请求）。
+
+    track_p5/P31：多执行 lane 共享同一缓冲时 peek+popleft 须在 lock 内
+    原子完成，否则两 lane 可能对同一请求计数/弹出错位。返回 (part, acc)；
+    缓冲已被其它 lane 取空时 part 为空。"""
+    part = deque()
+    acc = 0
+    with lock:
+        while buf:
+            sz = _req_size(ch, buf[0])
+            if acc and acc + sz > quota:
+                break
+            part.append(buf.popleft())
+            acc += sz
+    return part, acc
+
+
 def _enable_pdeathsig():
     """P25 A4：孤儿免疫的内核级兜底 —— PR_SET_PDEATHSIG(SIGKILL)。
 
@@ -108,6 +135,33 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
     heartbeat.value = time.time()
     slanet = TableStructureModel(use_gpu=True) if _need_tab else None
     heartbeat.value = time.time()
+    # track_p5/P27：SLANet 解码 Loop 换 torch CUDA Graph（编码器仍 ORT），
+    # 开关 gpu_server.slanet_torch_decoder，失败自动保留 ORT 会话。
+    if slanet is not None:
+        try:
+            from assay.slanet_torch_decoder import maybe_install
+            _tdec = maybe_install(slanet, cfg)
+        except Exception as e:
+            _tdec = False
+            print(f"[gpu-server] slanet torch decoder fail: {e}", flush=True)
+        print(f"[gpu-server] slanet torch decoder={_tdec}", flush=True)
+        heartbeat.value = time.time()
+    # track_p5/P31：slanet 通道多执行 lane。每 lane 独立 TableStructureModel
+    # （独立 ORT CUDA 会话）——同一 ORT CUDA 会话被两线程并发 Run 实测
+    # CUDA 700 illegal memory access，绝不共享。不同会话同批输出逐位一致
+    # （p30 bench A_vs_B maxdiff 0）。torch 解码器只装在主会话上，故启用时回退 1。
+    slanet_lanes = max(1, int(cfg.get("slanet_lanes", 1)))
+    if slanet is None:
+        slanet_lanes = 1
+    elif slanet_lanes > 1 and _tdec:
+        print("[gpu-server] slanet_lanes>1 ignored with torch decoder", flush=True)
+        slanet_lanes = 1
+    slanet_lane_models = [slanet]
+    for _ in range(slanet_lanes - 1):
+        slanet_lane_models.append(TableStructureModel(use_gpu=True))
+        heartbeat.value = time.time()
+    if slanet_lanes > 1:
+        print(f"[gpu-server] slanet lanes={slanet_lanes}", flush=True)
     # track_p3b 诊断：显式自报各模型实际 EP / 设备（spawn 子进程日志级别
     # 默认 WARNING，_log.info 不可见 —— 用 stderr 直出）
     try:
@@ -232,7 +286,8 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
             _log.warning(f"[gpu-server] slow cls batch: {dt_ms:.0f}ms "
                          f"({n} imgs)")
 
-    def _run_slanet(buf: deque):
+    def _run_slanet(buf: deque, model=None):
+        model = slanet if model is None else model
         t0 = time.perf_counter()
         # 请求 payload = crop_specs（TableModel.process_crops 契约）；
         # 合并成一次 engine(batch_size=…) 真批调用，再按请求切回。
@@ -250,7 +305,7 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
                 buf.clear()
                 return
             images = [sp["image"] for sp in all_specs]
-            result = slanet.engine(images, batch_size=slanet_max)
+            result = model.engine(images, batch_size=slanet_max)
             cb_list = result.cell_bboxes
             lp_list = result.logic_points
             i = 0
@@ -552,8 +607,16 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
               "yolo2": yolo2_max, "cslanet": cslanet_max}
     stop_evt = threading.Event()
 
-    def _serve(ch):
-        buf, runner = channels[ch]
+    drain_locks = {ch: threading.Lock() for ch in channels}
+    stats_lock = threading.Lock()
+    lane_runners = {ch: [entry[1]] for ch, entry in channels.items()}
+    if "slanet" in lane_runners:
+        lane_runners["slanet"] = [
+            (lambda b, _m=m: _run_slanet(b, _m)) for m in slanet_lane_models]
+
+    def _serve(ch, lane=0):
+        buf = channels[ch][0]
+        runner = lane_runners[ch][lane]
         window = window_ms_cfg[ch] / 1000.0
         quota = quotas[ch]
         # track_p5：合并通道用「真·凑批窗口」——首个请求到达后最多等
@@ -592,22 +655,9 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
                 time.sleep(window)
                 if not buf:
                     continue
-            part = deque()
-            acc = 0
-            while buf:
-                r = buf[0]
-                if ch in ("cls", "slanet"):
-                    sz = len(r["payload"])
-                elif ch == "cslanet":
-                    # payload 为 dict {'crops':…, 'offsets':…}，按 crop 计
-                    sz = len(r["payload"]["crops"])
-                else:
-                    # yolo / yolo2：按页
-                    sz = 1
-                if acc and acc + sz > quota:
-                    break
-                part.append(buf.popleft())
-                acc += sz
+            part, acc = _drain(buf, ch, quota, drain_locks[ch])
+            if not part:
+                continue
             _t0 = time.perf_counter()
             try:
                 runner(part)
@@ -615,13 +665,15 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
                 _log.error(f"[gpu-server] {ch} runner crashed: {e}")
                 for r in part:
                     _reply(r, False, repr(e))
-            exec_stats[ch][0] += acc
-            exec_stats[ch][1] += time.perf_counter() - _t0
-            exec_stats[ch][2] += 1   # 执行次数 → 退出时算真实平均批大小
+            _dt = time.perf_counter() - _t0
+            with stats_lock:
+                exec_stats[ch][0] += acc
+                exec_stats[ch][1] += _dt   # 多 lane 时为各 lane 忙时之和
+                exec_stats[ch][2] += 1   # 执行次数 → 退出时算真实平均批大小
 
-    _threads = [threading.Thread(target=_serve, args=(ch,), daemon=True,
-                                 name=f"gpu-{ch}")
-                for ch in channels]
+    _threads = [threading.Thread(target=_serve, args=(ch, ln), daemon=True,
+                                 name=f"gpu-{ch}" + (f"-{ln}" if ln else ""))
+                for ch in channels for ln in range(len(lane_runners[ch]))]
     for _t in _threads:
         _t.start()
 
