@@ -107,16 +107,24 @@ def _table_scale(page: fitz.Page, box: Rect) -> float:
 
 
 def _table_scale_cached(page: fitz.Page, box: Rect) -> float:
-    key = (id(page), round(box[0]), round(box[1]),
-           round(box[2]), round(box[3]))
-    val = _SCALE_CACHE.get(key)
+    # 缓存挂在 Page 对象上、随 Page 释放：按 id(page) 的全局字典永不
+    # 清理，Page 回收后 id 复用会把别页的字号命中给新页。
+    cache = getattr(page, _SCALE_ATTR, None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(page, _SCALE_ATTR, cache)
+        except AttributeError:
+            return _table_scale(page, box)
+    key = (round(box[0]), round(box[1]), round(box[2]), round(box[3]))
+    val = cache.get(key)
     if val is None:
         val = _table_scale(page, box)
-        _SCALE_CACHE[key] = val
+        cache[key] = val
     return val
 
 
-_SCALE_CACHE: dict = {}
+_SCALE_ATTR = "_assay_scale_cache"
 
 
 def _norm(s: str) -> str:

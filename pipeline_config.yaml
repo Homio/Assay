@@ -60,7 +60,7 @@ gpu_server:
   # async_depth 每 worker 在途上限封顶；剩余超时预算 < async_guard_s
   # 不偷，防超时误杀）。
   async_pipeline: true
-  async_depth: 4             # P31：配合 slanet_lanes=2 加深在途凑批（500 本 197.9→159.4s；原值 2）
+  async_depth: 4             # P31：配合 slanet_lanes=2 加深在途凑批（整日 d3 3511.9 / d4 3479.7s，差值在同码整日波动 3479.7–3566.4s 内，收益未证实；原值 2）
   async_wait_ms: 50
   async_guard_s: 10
 

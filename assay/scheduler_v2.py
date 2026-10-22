@@ -279,8 +279,10 @@ class SchedulerV2:
 
     # ── 派发 ───────────────────────────────────────────────────────────
 
-    def _pop_task(self) -> Optional[dict]:
-        """优先级 D>B>A + A 保底 + 书间 round-robin。"""
+    def _pop_task(self, allow_detect: bool = True) -> Optional[dict]:
+        """优先级 D>B>A + A 保底 + 书间 round-robin。
+
+        allow_detect=False：跳过 detect（crop 预算已满），build / text 照常。"""
         order = self.active
         if not order:
             return None
@@ -293,6 +295,8 @@ class SchedulerV2:
                     self.rr_ptr = (self.rr_ptr + k + 1) % n
                     return b.pending[PRIO_TEXT].popleft()
         for prio in (PRIO_BUILD, PRIO_DETECT, PRIO_TEXT):
+            if prio == PRIO_DETECT and not allow_detect:
+                continue
             for k in range(n):
                 b = order[(self.rr_ptr + k) % n]
                 if b.ok and b.pending[prio] \
@@ -312,17 +316,14 @@ class SchedulerV2:
     def dispatch(self):
         if self.pause_evt.is_set():
             return
-        while True:
-            if self.inflight_pages >= self.max_inflight_pages \
-                    or self.inflight_crops >= self.max_inflight_crops:
-                return
-            task = self._pop_task()
+        while self.inflight_pages < self.max_inflight_pages:
+            # crop 预算只节流 detect：待派 build 的实际 crop 已计入
+            # inflight_crops，而释放 crop 的正是 build 本身——若连 build /
+            # text 一并拦下，待派 build 占满预算且再无在途结果时将永久停派。
+            task = self._pop_task(allow_detect=(
+                self.inflight_crops + self.est_crops
+                <= self.max_inflight_crops))
             if task is None:
-                return
-            if self.inflight_crops + self._crop_est(task) \
-                    > self.max_inflight_crops:
-                self.books[task["book"]].pending[self._prio_of(
-                    task["kind"])].appendleft(task)
                 return
             w = self._weight(task)
             self.inflight_pages += w
@@ -347,6 +348,8 @@ class SchedulerV2:
         book.status = "ERROR"
         book.error = error
         for p in book.pending:
+            for t in book.pending[p]:
+                self._release_build_crops(t)
             book.pending[p].clear()
         book.t_end = time.time()
         self._finish_book(book, failed=True)
@@ -442,18 +445,14 @@ class SchedulerV2:
     def _handle_detect(self, book: _Book, res: dict):
         data = res["data"]
         p = res["task"]["page_idx"]
-        # 已知账目 bug（HEAD 既有，P25 不修）：`+= actual - est` 与
-        # _decrement 的 `-est` 重复扣减 → inflight_crops 单边负漂
-        #（p25_freeze200 实测 900s 漂到 -36964），crop 预算门因此不
-        # 再真实收紧。修正为 `+= actual` 语义更准，但会改变 dispatch
-        # 交错——p25b13 gate 实测计数层 regressions 23→24（燕京啤酒
-        # p86 gt#0 cov 0.89→0.78 边缘翻转，F1 不变），违反本单
-        # 「regressions=23 逐字一致」验收口径，故按边界纪律保持
-        # HEAD 原样、另行上报 CTO 决策。A1 防闩锁不依赖账目精确性
-        #（停更指纹判据对漂移免疫）。
+        # P33：detect 的预估 est 已由 _decrement 退还；实际 crop 只在
+        # 生成 build 任务时计入，由 _release_build_crops 在该 build 终结
+        #（成功 / 重试耗尽 / 书失败清队 / 迟到结果）时退还。原
+        # `+= actual - est` 与 _decrement 重复扣减，整日漂到 -23 万，
+        # crop 预算门形同失效。
         actual = int(data["n_crops"])
-        self.inflight_crops += actual - self.est_crops
         if data["pairs"]:
+            self.inflight_crops += actual
             book.pairs[p] = data["pairs"]
             book.pending[PRIO_BUILD].append({
                 "kind": "build", "book": book.book_id,
@@ -464,14 +463,17 @@ class SchedulerV2:
                 "n_crops": actual, "retry": 0,
             })
         else:
-            self.inflight_crops -= actual
             self._page_terminal(book)
+
+    def _release_build_crops(self, task):
+        if task["kind"] == "build":
+            self.inflight_crops -= int(task.get("n_crops", 0))
 
     def _handle_build(self, book: _Book, res: dict):
         task = res["task"]
         p = task["page_idx"]
         book.tables[p] = res["data"]["tables"]
-        self.inflight_crops -= int(task.get("n_crops", 0))
+        self._release_build_crops(task)
         self._page_terminal(book)
 
     def handle_result(self, res: dict):
@@ -489,8 +491,11 @@ class SchedulerV2:
             st["gpu_n"] += int(_v[0])
             st["gpu_s"] += float(_v[1])
         if not res.get("ok"):
-            if book.ok:
+            if not book.ok:
+                self._release_build_crops(task)
+            else:
                 if task.get("retry", 0) >= self.max_retries:
+                    self._release_build_crops(task)
                     self._fail_book(book, f"{task['kind']} task on page "
                                            f"{task.get('page_idx')} failed "
                                            f"after {self.max_retries} "
@@ -500,6 +505,7 @@ class SchedulerV2:
                     book.pending[self._prio_of(task["kind"])].appendleft(task)
             return
         if not book.ok:
+            self._release_build_crops(task)
             return  # 迟到的成功结果，忽略
         kind = task["kind"]
         if kind == "calib":
