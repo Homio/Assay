@@ -23,7 +23,7 @@ gpu_server:
   yolo_window_ms: 0          # yolo 无真批，到即执行
   cls_window_ms: 3           # cls 单图 ~0.18ms，窗口只为聚合并发请求
   slanet_window_ms: 5        # slanet 跨页聚合凑批（engine batch_size 真批）
-  slanet_lanes: 2            # track_p5/P31：slanet 通道执行 lane 数（每 lane 独立 ORT 会话，整日实测显存 +5~7GB/lane；1=原单线程行为）
+  slanet_lanes: 2            # track_p5/P31：slanet 通道执行 lane 数（每 lane 独立 ORT 会话，整日实测显存 +5~7GB/lane；1=原单线程行为）；P34 起 slanet_torch_decoder=true 时忽略（强制单 lane），仅 ORT 回退路径生效
   slow_batch_ms: 2000        # 单批超过该耗时打 WARN 日志
   # ── track_p5：合并调用通道（detect 任务 GPU 往返 5 跳 → 2 跳）────────
   # 总开关：false 时 worker 走 P3b 三通道路径，逐位不变（legacy 回退）。
@@ -48,12 +48,13 @@ gpu_server:
   split_servers: true        # track_p5: GPU 服务拆分双进程（yolo | cls+slanet），默认 false 单服务回退
   # ── track_p5/P27：SLANet 解码器 torch CUDA Graph 化 ──
   # false = legacy 整图 ORT（含 Loop）；true = 编码器 ORT + 解码 Loop 由
-  # torch 单步 CUDA Graph 逐步回放（全 FP32：TF32 非批不变会翻近平票 token；逐步判停与 ORT 同步），
-  # 任何异常自动回退原 ORT 会话。
-  slanet_torch_decoder: false
+  # torch 单步 CUDA Graph 逐步回放（逐步判停与 ORT 同步），任何异常自动回退原 ORT 会话。
+  # P34 上线（配 slanet_decoder_tf32=true）：整日 3144.1s vs 同日 P33b 3559.7 / HEAD 3566.4s，
+  # 表格 197141（±1 已知双稳态书），s500 仲裁 + a13 门禁通过；显存峰值 ~6.3GB（ORT 19.6–24.6GB）
+  slanet_torch_decoder: true
   slanet_decoder_slots: [32, 48]   # 预捕获的固定批尺寸（须 ≥ slanet/cslanet_batch_max）
   slanet_decoder_max_steps: 500    # 解码步上限 assign_0（Loop 步 0..500 含端点，至多 501 步）
-  slanet_decoder_tf32: false     # 解码器 TF32（false=精密 FP32；true=对齐 ORT 默认 TF32 精度）
+  slanet_decoder_tf32: true      # 解码器 TF32（false=精密 FP32，批不变但与现网 ORT 数值不同；true=对齐 ORT CUDA EP 默认 TF32 精度，P34 生产值）
   # ── track_p5/P17 spike：worker 异步流水（detect 等待期任务窃取） ──
   # false = 未 armed 逐位 legacy；true 后 GPU 回包等待超 async_wait_ms
   # 即从共享任务队列窃取任务执行（text/build/calib 任意，detect 受
