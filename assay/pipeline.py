@@ -1,11 +1,14 @@
 """
-Multi-worker pipeline orchestrator using ProcessPoolExecutor.
+Pipeline orchestrator with two execution paths.
 
-Architecture:
-  - N CPU workers, each loading its own TableModel (shared-nothing)
-  - Each worker processes one PDF independently
-  - Files distributed via ProcessPoolExecutor
-  - CUDA time-slicing handles concurrent GPU access transparently
+  - v2 (default for directory mode with >=2 PDFs): page-granular
+    scheduling (assay.scheduler_v2) with a resident GPU inference
+    service (assay.gpu_server) and CPU-only workers (assay.worker_v2);
+    all scheduling/threshold/watchdog knobs live in pipeline_config.yaml.
+  - legacy (this module): per-file ProcessPoolExecutor — each worker
+    loads its own TableModel (shared-nothing) and processes whole PDFs;
+    CUDA time-slicing handles concurrent GPU access.  Still used for
+    single-file runs and as the ASSAY_PIPELINE=legacy fallback.
 """
 
 from __future__ import annotations

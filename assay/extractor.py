@@ -44,7 +44,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-PAGE_ZOOM = 2.0            # ~150 DPI rendering
+PAGE_ZOOM = 2.0            # 144 DPI rendering (72 DPI base × 2.0)
 
 # Pre-flight: dual-signal heuristic to skip non-table pages
 MIN_DIGITS_FOR_TABLE = 40     # Chinese financial tables often mix text + numbers,
