@@ -153,7 +153,7 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
     # （独立 ORT CUDA 会话）——同一 ORT CUDA 会话被两线程并发 Run 实测
     # CUDA 700 illegal memory access，绝不共享。不同会话同批输出逐位一致
     # （p30 bench A_vs_B maxdiff 0）。torch 解码器只装在主会话上，故启用时回退 1。
-    slanet_lanes = max(1, int(cfg.get("slanet_lanes", 1)))
+    slanet_lanes = max(1, int(cfg.get("slanet_lanes", 2)))
     if slanet is None:
         slanet_lanes = 1
     elif slanet_lanes > 1 and _tdec:
@@ -202,14 +202,14 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
     #   合批（ultralytics list source）。list 批与逐页 predict 存在
     #   ~1e-4 量级 conf fp 抖动（同 P3a/P3b 已豁免的 CUDA 抖动类，
     #   A/B 见 track_p5/ab_yolo_listbatch.py），可经本开关整体回退。
-    yolo_list_batch = bool(cfg.get("yolo_list_batch", True))
-    yolo2_max = int(cfg.get("yolo2_drain_max", 8))
+    yolo_list_batch = bool(cfg.get("yolo_list_batch", False))
+    yolo2_max = int(cfg.get("yolo2_drain_max", 16))
     # cslanet：一次往返完成整页全部 crop 的 PP-LCNet 门控 + SLANet 结构
     #   （cls 与 slanet 在服务端并行执行，eager：门控在本批内几乎不
     #   裁剪——P3b 实测 337 cls → 337 slanet；多算的 slanet 结果被
     #   worker 丢弃，可观察输出不变）。
-    cslanet_max = int(cfg.get("cslanet_batch_max", 32))
-    prep_threads = max(1, int(cfg.get("cslanet_prep_threads", 4)))
+    cslanet_max = int(cfg.get("cslanet_batch_max", 48))
+    prep_threads = max(1, int(cfg.get("cslanet_prep_threads", 2)))
     # yolo2 std/fb 两组独立 predict 的并行度（fb 组与 std 组的 CPU
     # 前后处理重叠、GPU 内核仍按驱动排队；1 = 串行回退）。
     yolo2_pred_threads = max(1, int(cfg.get("yolo2_pred_threads", 2)))
@@ -600,8 +600,8 @@ def gpu_server_main(infer_q, heartbeat, reply_queues, cfg,
         # track_p5 合并通道：yolo2 凑批窗口与 yolo 同理取 0（积压来自
         # 自然并发）；cslanet 沿用 slanet 的 5ms 微窗（默认值均可由
         # pipeline_config.yaml 覆盖，零硬编码）。
-        "yolo2": float(cfg.get("yolo2_window_ms", 0.0)),
-        "cslanet": float(cfg.get("cslanet_window_ms", 5.0)),
+        "yolo2": float(cfg.get("yolo2_window_ms", 25.0)),
+        "cslanet": float(cfg.get("cslanet_window_ms", 350.0)),
     }
     # 单批次上限：yolo 按页（无真批，只控单批页数）；cls 按图；
     # slanet 按 crop（engine batch_size 真批）。

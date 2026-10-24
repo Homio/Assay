@@ -304,7 +304,7 @@ def maybe_install(table_model, cfg: Optional[dict]) -> bool:
     a broken decoder never takes the pipeline down.
     """
     cfg = cfg or {}
-    if not cfg.get("slanet_torch_decoder", False):
+    if not cfg.get("slanet_torch_decoder", True):
         return False
     try:
         session = table_model.engine.table_structure.session.session
@@ -323,7 +323,7 @@ def maybe_install(table_model, cfg: Optional[dict]) -> bool:
             slot_sizes=slots,
             max_steps=int(cfg.get("slanet_decoder_max_steps", 500)),
             fallback_session=table_model.engine.table_structure.session.session,
-            tf32=bool(cfg.get("slanet_decoder_tf32", False)),
+            tf32=bool(cfg.get("slanet_decoder_tf32", True)),
         )
         table_model.engine.table_structure.session.session = session
         return True

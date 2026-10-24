@@ -40,7 +40,7 @@ _DOC_CACHE = _OrderedDict()   # path -> doc（插入序 = LRU 冷端）
 _DOC_PINS = {}               # path -> pin 计数（同书嵌套可叠）
 # P25 A3：缓存槽位上限由 worker_main 按 pipeline_config.yaml
 #（scheduler.worker_doc_cache_cap）覆盖；模块默认仅兜底。
-_DOC_CAP = 16                # 每 worker 最多常开的 doc 数
+_DOC_CAP = 8                 # 每 worker 最多常开的 doc 数（与配置一致）
 
 
 def _enable_pdeathsig():
@@ -283,24 +283,24 @@ def worker_main(worker_id, task_q, result_q, infer_q, reply_q,
     # 0 = 不动）；doc LRU 缓存槽位上限。
     global _DOC_CAP
     _DOC_CAP = max(1, int(cfg.get("doc_cache_cap", _DOC_CAP)))
-    store_mb = int(cfg.get("worker_store_mb", 0))
+    store_mb = int(cfg.get("worker_store_mb", 64))
     if store_mb > 0:
         import fitz
         fitz.TOOLS.store_maxsize = store_mb << 20
-    release_on_pause = bool(cfg.get("release_on_pause", False))
+    release_on_pause = bool(cfg.get("release_on_pause", True))
     timeout_s = float(cfg.get("gpu_timeout_s", 60.0))
     fused_calls = bool(cfg.get("fused_calls", False))
-    seed_header_sigs = bool(cfg.get("seed_header_sigs", False))
-    if cfg.get("textpage_memo", False):
+    seed_header_sigs = bool(cfg.get("seed_header_sigs", True))
+    if cfg.get("textpage_memo", True):
         from assay import textpage_memo
         textpage_memo.install(
             clip=bool(cfg.get("textpage_memo_clip", False)))
     client = GpuClient(infer_q, reply_q, worker_id, timeout_s=timeout_s,
                        infer_q_csl=infer_q_csl)
-    async_on = bool(cfg.get("async_pipeline", False))
+    async_on = bool(cfg.get("async_pipeline", True))
     if async_on:
         client.arm_steal(task_q, active_slots,
-                         depth=int(cfg.get("async_depth", 2)),
+                         depth=int(cfg.get("async_depth", 4)),
                          wait_ms=float(cfg.get("async_wait_ms", 50.0)),
                          guard_s=float(cfg.get("async_guard_s", 10.0)))
 

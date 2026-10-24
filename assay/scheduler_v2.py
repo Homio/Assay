@@ -43,7 +43,7 @@ PRIO_TEXT = 2
 
 
 def load_pipeline_config(search_dirs: Optional[List[str]] = None) -> dict:
-    """读 pipeline_config.yaml（v2 管道唯一阈值源；缺失时用内置默认值）。"""
+    """读 pipeline_config.yaml（v2 管道唯一阈值源；缺失即 fail-loud 退出）。"""
     import yaml
 
     candidates = []
@@ -55,8 +55,11 @@ def load_pipeline_config(search_dirs: Optional[List[str]] = None) -> dict:
         if c.is_file():
             with open(c, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
-    _log.warning("pipeline_config.yaml not found; using built-in defaults")
-    return {}
+    # fail-loud：配置缺失绝不允许静默回退到代码内置值——配置-only 的
+    # 修复（如 resume 水位滞回 8192→6656）会因此无声失效。
+    raise SystemExit(
+        "pipeline_config.yaml not found in: "
+        + ", ".join(str(c) for c in candidates))
 
 
 class _Book:
@@ -109,7 +112,7 @@ class SchedulerV2:
         self.num_workers = max(2, num_workers if (num_workers or 0) > 1
                                else workers_cfg)
         self.calib_chunk = max(1, int(sched.get("calib_chunk_pages", 32)))
-        self.seed_ug_span = bool(sched.get("worker_seed_ug_span", False))
+        self.seed_ug_span = bool(sched.get("worker_seed_ug_span", True))
         self.a_floor_frac = float(sched.get("a_floor_fraction", 0.25))
         self.max_retries = int(sched.get("max_task_retries", 2))
         self.max_active_books = int(sched.get("max_active_books", 50))
@@ -125,9 +128,10 @@ class SchedulerV2:
         self.wd_cfg = wd
         self.gpu_cfg = cfg.get("gpu_server") or {}
         # track_p5/p13b：GPU 服务拆分双进程（yolo 服务 / cls+slanet
-        # 服务），各自独立 GIL/CUDA 上下文；默认 false = 单服务回退。
+        # 服务），各自独立 GIL/CUDA 上下文；默认 true（与配置一致），
+        # false = 单服务回退。
         self.split_servers = bool(self.gpu_cfg.get(
-            "split_servers", False))
+            "split_servers", True))
 
         self.inflight_pages = 0
         self.inflight_crops = 0
@@ -524,7 +528,7 @@ class SchedulerV2:
         interval = float(cfg.get("sample_interval_s", 1.0))
         pause_mib = float(cfg.get("pause_mem_available_mib", 6144))
         shrink_mib = float(cfg.get("shrink_mem_available_mib", 5325))
-        resume_mib = float(cfg.get("resume_mem_available_mib", 8192))
+        resume_mib = float(cfg.get("resume_mem_available_mib", 6656))
         sustain_s = float(cfg.get("resume_sustain_s", 5.0))
         min_active = int(cfg.get("min_active_workers", 8))
         load_pause = float(cfg.get("loadavg_pause", 19.0))
@@ -668,26 +672,26 @@ class SchedulerV2:
         worker_cfg = {
             "gpu_timeout_s": self.gpu_timeout_s,
             # track_p5：合并调用开关（gpu_server.fused_calls，默认
-            # true；false = P3b 三通道路径逐位不变）。
-            "fused_calls": bool(self.gpu_cfg.get("fused_calls", True)),
+            # false = P3b 三通道路径逐位不变，与 pipeline_config.yaml 一致）。
+            "fused_calls": bool(self.gpu_cfg.get("fused_calls", False)),
             # track_p5/P17 spike：worker 异步流水（detect 等待期任务
             # 窃取）。async_pipeline=false = 未 armed，逐位 legacy。
             "async_pipeline": bool(self.gpu_cfg.get(
-                "async_pipeline", False)),
-            "async_depth": int(self.gpu_cfg.get("async_depth", 2)),
+                "async_pipeline", True)),
+            "async_depth": int(self.gpu_cfg.get("async_depth", 4)),
             "async_wait_ms": float(self.gpu_cfg.get(
                 "async_wait_ms", 50.0)),
             "async_guard_s": float(self.gpu_cfg.get(
                 "async_guard_s", 10.0)),
             # P25 A3：worker 内存治理——MuPDF store 限额（死配置接线）
             # 与 fitz doc LRU 缓存槽位上限（16→8）。
-            "worker_store_mb": int(sched.get("worker_store_mb", 0)),
+            "worker_store_mb": int(sched.get("worker_store_mb", 64)),
             "doc_cache_cap": int(sched.get("worker_doc_cache_cap", 8)),
             # P29：worker 页眉校准缓存由调度器 header_sigs 预置（免整本重扫）。
             "seed_header_sigs": bool(sched.get("worker_seed_header_sigs",
-                                               False)),
+                                               True)),
             # P29b：worker 内 page.get_text("dict") 按 Page 对象记忆化。
-            "textpage_memo": bool(sched.get("worker_textpage_memo", False)),
+            "textpage_memo": bool(sched.get("worker_textpage_memo", True)),
             # P30：同一 Page 同选项同 clip 的 get_text 记忆化（需 textpage_memo）。
             "textpage_memo_clip": bool(sched.get("worker_textpage_memo_clip",
                                                  False)),
