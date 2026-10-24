@@ -31,6 +31,12 @@ Thumbs.db
 *.bin
 *.ckpt
 
+# Runtime-required weights are whitelisted so a fresh clone runs out of
+# the box; everything else (unused PP-OCR weights, fp16 cache) stays out.
+!model/doclayout_yolo_ft.pt
+!model/PP-LCNet_x1_0_table_cls.onnx
+!model/slanet-plus.onnx
+
 # Output
 output/
 *.log

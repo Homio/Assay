@@ -132,7 +132,7 @@ Label Studio 标注工具链（建项目、导任务、导入人工标注）见 
 | PP-LCNet_x1_0 | ONNX | 表/非表门控分类 | ONNX Runtime（CUDA EP） |
 | SLANet-Plus | ONNX | 表格结构识别（行列拓扑） | ONNX Runtime（CUDA EP）；解码器默认走 torch CUDA Graph + TF32，异常回退 ORT |
 
-模型文件存放于 `model/` 目录（本地存放，不入库）。
+三个模型文件随仓库分发（`model/` 目录），clone 后即可直接运行，无需额外下载。
 
 ## 环境要求
 
@@ -146,6 +146,7 @@ Label Studio 标注工具链（建项目、导任务、导入人工标注）见 
 Assay/
 ├── assay.py                    # CLI 入口（单文件 in-process / 批量分流）
 ├── pipeline_config.yaml        # v2 管道唯一阈值源
+├── model/                      # 运行时权重（随仓库分发）
 ├── assay/
 │   ├── __init__.py             # 公开 API
 │   ├── pipeline.py             # 编排器（legacy 路径 + v2 分流）
