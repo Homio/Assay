@@ -1,7 +1,8 @@
 """
 GPU 常驻单推理服务（track_p3b 阶段 3，P2 设计第 3 层）。
 
-独占 GPU0 的单实例常驻进程，持有全部三个模型（PP-LCNet 门控 /
+独占单 GPU（默认 GPU0，见下方 CUDA_VISIBLE_DEVICES 说明）的单实例
+常驻进程，持有全部三个模型（PP-LCNet 门控 /
 YOLO 页检测 / SLANet 结构），对跨页、跨本的推理请求做动态批。
 CPU worker 通过 GpuClient 把请求投进 infer_q，阻塞等各自的专属
 回包队列；服务按通道（yolo / cls / slanet）凑批，批满或收集窗口
@@ -33,9 +34,11 @@ from typing import Dict, List, Tuple
 
 _log = logging.getLogger(__name__)
 
-# GPU0 only — GPU1 上有常驻租户，绝不触碰。在 import 任何 CUDA 依赖前
-# 生效（spawn 子进程入口即调用）。
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# GPU 选择：默认物理 GPU 0，可用 ASSAY_GPU_INDEX 选其他物理卡；调用方
+# 显式设置的 CUDA_VISIBLE_DEVICES 优先（setdefault 不覆盖）。在 import
+# 任何 CUDA 依赖前生效（spawn 子进程入口即调用）。
+os.environ.setdefault(
+    "CUDA_VISIBLE_DEVICES", os.environ.get("ASSAY_GPU_INDEX", "0"))
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 

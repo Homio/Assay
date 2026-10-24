@@ -64,7 +64,7 @@ _ensure_cudnn_path()
 # Model paths
 # ──────────────────────────────────────────────────────────────────────────────
 
-MODEL_DIR = Path("/home/homio/sda/1111/Assay/model")
+MODEL_DIR = Path(__file__).resolve().parent.parent / "model"
 SLANET_PATH = str(MODEL_DIR / "slanet-plus.onnx")
 PPLCNET_PATH = str(MODEL_DIR / "PP-LCNet_x1_0_table_cls.onnx")
 

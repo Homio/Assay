@@ -25,6 +25,7 @@ from typing import List, Tuple
 
 import fitz
 
+from assay.models import MODEL_DIR
 from assay.rulings import (
     detect_ruling_rects,
     extract_line_segments,
@@ -50,7 +51,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-YOLO_MODEL_PATH = "/home/homio/sda/1111/Assay/model/doclayout_yolo_ft.pt"
+YOLO_MODEL_PATH = str(MODEL_DIR / "doclayout_yolo_ft.pt")
 
 YOLO_CONFIDENCE = 0.3       # YOLO detection confidence threshold
 YOLO_CONFIDENCE_FALLBACK = 0.05  # fallback for wireless/borderless tables
