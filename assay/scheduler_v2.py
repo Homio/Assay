@@ -167,6 +167,19 @@ class SchedulerV2:
         # track_p3b 画像：按任务类别聚合 worker 执行耗时与 GPU 等待
         self.stage_stats: Dict[str, dict] = {}
 
+        # ── t13/t16：假死防护（子进程存活检查 + 可选整轮墙钟超时）─────────
+        # t16/F4：total_timeout_s 默认 **0 = 关闭**。原因：生产公告量
+        # 中位数 1473 / P90 3368 / 峰值 28975 个 PDF，而 v2 从未在该量级跑过
+        # 基准，任何硬编码上限都可能是误杀（1800s 意味着峰值日需 0.06s/文件）。
+        # 秒级主防线是 worker/GPU 存活巡检（与耗时无关，恒有效）；墙钟超时
+        # 仅作可选兜底，需先基准测试再用 pipeline_config.yaml 显式开启。
+        self.total_timeout_s = float(sched.get("total_timeout_s", 0.0) or 0.0)
+        self.gpu_dead_grace_s = float(sched.get("gpu_dead_grace_s", 10.0))
+        self.fail_fast_on_worker_exit = bool(
+            sched.get("fail_fast_on_worker_exit", True))
+        self.worker_procs: List = []
+        self._gpu_all_dead_since: Optional[float] = None
+
     # ── 记账辅助 ────────────────────────────────────────────────────────
 
     def _weight(self, task) -> int:
@@ -658,6 +671,106 @@ class SchedulerV2:
                 self._restart_requested.set()
             time.sleep(interval)
 
+    # ── t13：子进程存活检查 / 清理 ──────────────────────────────────────
+
+    @staticmethod
+    def _proc_fingerprint(p) -> str:
+        """进程可读标识：name(pid, exitcode=N)，用于异常信息定位。"""
+        try:
+            code = p.exitcode
+        except Exception:  # noqa: BLE001
+            code = "?"
+        return f"{p.name}(pid={p.pid}, exitcode={code})"
+
+    def _check_worker_liveness(self) -> Optional[str]:
+        """检查 CPU worker 存活。返回异常描述；全部健康返回 None。
+
+        关键事故场景：所有 worker 已退出（崩溃/被 OOM kill），task_q 里残留
+        的任务再也不会有人处理，而主循环只看 done_count → 永久空转。这里
+        每轮（0.25s）巡检，秒级暴露，不依赖 total_timeout_s 兜底。
+        """
+        procs = self.worker_procs
+        if not procs:
+            return None
+        dead = [p for p in procs if not p.is_alive()]
+        if not dead:
+            return None
+        if not self.fail_fast_on_worker_exit and len(dead) < len(procs):
+            # 宽松模式：仍有 worker 存活时容忍个别死亡（默认不放宽）
+            return None
+        detail = ", ".join(self._proc_fingerprint(p) for p in dead)
+        alive = len(procs) - len(dead)
+        return (f"{len(dead)}/{len(procs)} 个 CPU worker 已退出"
+                f"（存活 {alive}）：{detail}")
+
+    def _check_gpu_liveness(self) -> Optional[str]:
+        """检查 GPU server 存活，**逐个进程**判定。返回异常描述或 None。
+
+        ⚠️ t16/F3：不能用 `any(p.is_alive())` 一票通过。split_servers=true
+        （生产默认）时存在两个独立服务进程（yolo / cls+slanet），但 heartbeat
+        是**共享** mp.Value——活着的那个会持续续命，看门狗永远不会置
+        _restart_requested；若此处再只看 any()，单进程死亡就彻底隐身，其后该
+        通道所有请求 60s 超时、任务重试耗尽后整本书失败。实测过该场景。
+        现在：任一 GPU 进程死亡立刻记录 name/pid/exitcode 并请求重启；重启由
+        主循环的 _maybe_restart_gpu_server() 统一执行（整体重建 gpu_procs）。
+        只有「死亡后持续超过 gpu_dead_grace_s 仍未能恢复」才判定不可恢复。
+        """
+        procs = getattr(self, "gpu_procs", None) or []
+        if not procs:
+            return None
+        dead = [p for p in procs if not p.is_alive()]
+        if not dead:
+            self._gpu_all_dead_since = None
+            return None
+
+        # 有进程死亡：立刻要求重启（不等 heartbeat，heartbeat 会被存活进程续命）
+        self._restart_requested.set()
+        detail = ", ".join(self._proc_fingerprint(p) for p in dead)
+        now = time.monotonic()
+        if self._gpu_all_dead_since is None:
+            self._gpu_all_dead_since = now
+            _log.error("[v2] GPU server 进程死亡：%s（存活 %d/%d）— 请求重启",
+                       detail, len(procs) - len(dead), len(procs))
+            return None  # 进入宽限期，交给重启路径
+        dead_for = now - self._gpu_all_dead_since
+        if dead_for < self.gpu_dead_grace_s:
+            return None
+        return (f"GPU server 进程死亡且 {dead_for:.1f}s 内未能重启"
+                f"（宽限 {self.gpu_dead_grace_s:.0f}s）：{detail}")
+
+    def _cleanup_children(self, wait_s: float = 20.0) -> None:
+        """终止并 join 所有已启动的 worker / GPU server，避免孤儿进程。
+
+        幂等：正常收尾已 join 过会直接返回。异常路径（超时/子进程崩溃）由
+        run() 的 finally 调用，确保不留下长期驻留进程。
+        """
+        self._stop.set()
+        targets = list(self.worker_procs) + list(
+            getattr(self, "gpu_procs", None) or [])
+        for p in targets:
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        deadline = time.monotonic() + wait_s
+        for p in targets:
+            remain = max(0.0, deadline - time.monotonic())
+            try:
+                p.join(remain)
+                if p.is_alive():
+                    p.kill()
+                    p.join(5)
+            except Exception:  # noqa: BLE001
+                pass
+        for p in targets:
+            try:
+                if p.is_alive():  # 最后兜底，仍活着就强杀
+                    p.kill()
+                    p.join(2)
+            except Exception:  # noqa: BLE001
+                pass
+
     # ── 主入口 ──────────────────────────────────────────────────────────
 
     def run(self, pdf_paths: List[str]) -> float:
@@ -701,24 +814,40 @@ class SchedulerV2:
                 "release_on_pause", True)),
         }
         workers = []
-        for i in range(self.num_workers):
-            p = self.ctx.Process(target=worker_main,
-                                 args=(i, self.task_q, self.result_q,
-                                       self.infer_q, self.reply_queues[i],
-                                       self.active_slots, worker_cfg,
-                                       self.infer_q_csl
-                                       if self.split_servers else None,
-                                       self.pause_evt),
-                                 # P25 A4：孤儿免疫——daemon=True；kill -9
-                                 # 场景由 worker 主循环 ppid==1 自检兜底。
-                                 name=f"worker-{i:02d}", daemon=True)
-            p.start()
-            workers.append(p)
-        self._spawn_gpu_server()
+        # t16/F1：启动阶段也必须可清理。旧实现里 worker 循环、GPU server 与
+        # watchdog 的启动都在主 try 之外，且 self.worker_procs 在循环**之后**
+        # 才赋值——第 N 个 worker start() 抛异常时，前 N-1 个既没被登记也没被
+        # 清理，成为孤儿（daemon=True 只在父进程退出时才兜底）。
+        # 现在：启动放进 try，且每个进程 start() 成功后**立即**登记。
+        self.worker_procs = workers
+        wd_thread = None
+        try:
+            for i in range(self.num_workers):
+                p = self.ctx.Process(target=worker_main,
+                                     args=(i, self.task_q, self.result_q,
+                                           self.infer_q, self.reply_queues[i],
+                                           self.active_slots, worker_cfg,
+                                           self.infer_q_csl
+                                           if self.split_servers else None,
+                                           self.pause_evt),
+                                     # P25 A4：孤儿免疫——daemon=True；kill -9
+                                     # 场景由 worker 主循环 ppid==1 自检兜底。
+                                     name=f"worker-{i:02d}", daemon=True)
+                p.start()
+                workers.append(p)          # 立即登记，start 失败前已启动的不丢
+            self._spawn_gpu_server()
 
-        wd_thread = threading.Thread(target=self._watchdog_loop,
-                                     name="watchdog", daemon=True)
-        wd_thread.start()
+            wd_thread = threading.Thread(target=self._watchdog_loop,
+                                         name="watchdog", daemon=True)
+            wd_thread.start()
+        except BaseException:
+            # 启动失败：回收所有已启动的 worker / GPU server 后原样抛出
+            _log.error("[v2] startup failed — cleaning up already-started "
+                       "children (%d workers, %d gpu procs)",
+                       len(self.worker_procs),
+                       len(getattr(self, "gpu_procs", None) or []))
+            self._cleanup_children()
+            raise
 
         print(f"\n{'='*60}")
         print(f"  Assay — Table Extraction Pipeline (v2 page-granular)")
@@ -728,80 +857,115 @@ class SchedulerV2:
         print(f"{'='*60}", flush=True)
 
         idle_ticks = 0
-        while self.done_count < len(self.books):
-            self._maybe_restart_gpu_server()
-            try:
-                res = self.result_q.get(timeout=0.25)
-            except _queue.Empty:
-                res = None
-            if res is not None:
-                idle_ticks = 0
-                self.handle_result(res)
-            else:
-                idle_ticks += 1
-            self.dispatch()
-            if idle_ticks > 0 and idle_ticks % 40 == 0:
-                # 周期性诊断：完全无结果且无待派任务 = 卡死信号
-                if self.inflight_pages == 0 and not any(
-                        b.has_pending() for b in self.active) \
-                        and not self.queue_books and self.active:
-                    _log.error("[v2] deadlock suspected: active books with "
-                               "no inflight/pending tasks")
-                    for b in self.active:
-                        self._fail_book(b, "scheduler deadlock detected")
-
-        # ── 收尾 ──
-        # P18（条件4）：sentinel 前队列清空语义。主循环退出条件
-        # done_count == len(books) 已蕴含所有 book 终结（成功书全页
-        # terminal；失败书 pending 已清、迟到回包被 handle_result 幂等
-        # 忽略），此刻 task_q 残留只可能是已终结 book 的迟到死信任务
-        #（窃取/stash 交错产生）。drain 丢弃 = 哨兵必然进入已清空队列
-        #（语义显式化），避免退出路径的无意义执行；计数 > 0 即审计
-        # 信号（预期恒 0，spike 实测 stash_left/reply_cache_left 全零）。
-        # 失败重投天然有界（max_retries 硬上限），不选 deadline 方案
-        # 以免给纯计数语义引入墙钟非确定性。
-        drained = 0
+        # t13：整轮墙钟超时（monotonic 口径，抗系统时间跳变）
+        t_mono = time.monotonic()
+        deadline = (t_mono + self.total_timeout_s
+                    if self.total_timeout_s > 0 else None)
         try:
-            while True:
-                self.task_q.get_nowait()
-                drained += 1
-        except _queue.Empty:
-            pass
-        if drained:
-            print(f"[v2] tail drain: {drained} stale tasks dropped "
-                  f"before sentinels", flush=True)
-        self._stop.set()
-        for _ in workers:
-            self.task_q.put(None)
-        for p in workers:
-            p.join(30)
-        self.infer_q.put(None)
-        if self.split_servers:
-            self.infer_q_csl.put(None)
-        for p in self.gpu_procs:
-            p.join(30)
+            while self.done_count < len(self.books):
+                # ── t13 假死防护①：整轮墙钟超时 ──────────────────────
+                if deadline is not None and time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"Assay v2 整轮超时：已运行 "
+                        f"{time.monotonic() - t_mono:.0f}s > "
+                        f"total_timeout_s={self.total_timeout_s:.0f}s"
+                        f"（完成 {self.done_count}/{len(self.books)} 本，"
+                        f"在制页 {self.inflight_pages}，"
+                        f"在制 crop {self.inflight_crops}）")
 
-        elapsed = time.time() - t_start
-        total = len(self.books)
-        print(f"{'='*60}")
-        print("  stage profile (worker-exec wall, incl. GPU waits):")
-        for _k in ("calib", "text", "detect", "build"):
-            _st = self.stage_stats.get(_k)
-            if not _st:
-                continue
-            print(f"    {_k:6s} n={_st['n']:5d} sum={_st['dt']:8.1f}s "
-                  f"max={_st['dt_max']:6.2f}s gpu_calls={_st['gpu_n']:6d} "
-                  f"gpu_wait={_st['gpu_s']:8.1f}s")
-        print(f"{'='*60}", flush=True)
-        print(f"  {total - self.fail_count}/{total} succeeded, "
-              f"{self.fail_count} failed")
-        print(f"  {self.total_tables} tables extracted")
-        if self.gpu_restarts:
-            print(f"  GPU server restarts: {self.gpu_restarts}")
-        print(f"  Wall time: {elapsed:.1f}s "
-              f"({elapsed / max(1, total):.1f}s/file)")
-        print(f"{'='*60}", flush=True)
-        return elapsed
+                # ── t13 假死防护②：子进程存活巡检（秒级暴露）─────────
+                # 事故根因：worker 全部退出后 task_q 无人消费，而退出条件
+                # 只看 done_count → 主循环 100% CPU 空转直至人工终止。
+                err = self._check_worker_liveness()
+                if err:
+                    raise RuntimeError(
+                        f"Assay v2 子进程异常退出：{err}"
+                        f"（完成 {self.done_count}/{len(self.books)} 本，"
+                        f"在制页 {self.inflight_pages}，"
+                        f"在制 crop {self.inflight_crops}）")
+                err = self._check_gpu_liveness()
+                if err:
+                    raise RuntimeError(
+                        f"Assay v2 GPU 服务不可用：{err}"
+                        f"（完成 {self.done_count}/{len(self.books)} 本）")
+
+                self._maybe_restart_gpu_server()
+                try:
+                    res = self.result_q.get(timeout=0.25)
+                except _queue.Empty:
+                    res = None
+                if res is not None:
+                    idle_ticks = 0
+                    self.handle_result(res)
+                else:
+                    idle_ticks += 1
+                self.dispatch()
+                if idle_ticks > 0 and idle_ticks % 40 == 0:
+                    # 周期性诊断：完全无结果且无待派任务 = 卡死信号
+                    if self.inflight_pages == 0 and not any(
+                            b.has_pending() for b in self.active) \
+                            and not self.queue_books and self.active:
+                        _log.error("[v2] deadlock suspected: active books "
+                                   "with no inflight/pending tasks")
+                        for b in self.active:
+                            self._fail_book(b, "scheduler deadlock detected")
+
+            # ── 收尾 ──
+            # P18（条件4）：sentinel 前队列清空语义。主循环退出条件
+            # done_count == len(books) 已蕴含所有 book 终结（成功书全页
+            # terminal；失败书 pending 已清、迟到回包被 handle_result 幂等
+            # 忽略），此刻 task_q 残留只可能是已终结 book 的迟到死信任务
+            #（窃取/stash 交错产生）。drain 丢弃 = 哨兵必然进入已清空队列
+            #（语义显式化），避免退出路径的无意义执行；计数 > 0 即审计
+            # 信号（预期恒 0，spike 实测 stash_left/reply_cache_left 全零）。
+            # 失败重投天然有界（max_retries 硬上限），不选 deadline 方案
+            # 以免给纯计数语义引入墙钟非确定性。
+            drained = 0
+            try:
+                while True:
+                    self.task_q.get_nowait()
+                    drained += 1
+            except _queue.Empty:
+                pass
+            if drained:
+                print(f"[v2] tail drain: {drained} stale tasks dropped "
+                      f"before sentinels", flush=True)
+            self._stop.set()
+            for _ in workers:
+                self.task_q.put(None)
+            for p in workers:
+                p.join(30)
+            self.infer_q.put(None)
+            if self.split_servers:
+                self.infer_q_csl.put(None)
+            for p in self.gpu_procs:
+                p.join(30)
+
+            elapsed = time.time() - t_start
+            total = len(self.books)
+            print(f"{'='*60}")
+            print("  stage profile (worker-exec wall, incl. GPU waits):")
+            for _k in ("calib", "text", "detect", "build"):
+                _st = self.stage_stats.get(_k)
+                if not _st:
+                    continue
+                print(f"    {_k:6s} n={_st['n']:5d} sum={_st['dt']:8.1f}s "
+                      f"max={_st['dt_max']:6.2f}s gpu_calls={_st['gpu_n']:6d} "
+                      f"gpu_wait={_st['gpu_s']:8.1f}s")
+            print(f"{'='*60}", flush=True)
+            print(f"  {total - self.fail_count}/{total} succeeded, "
+                  f"{self.fail_count} failed")
+            print(f"  {self.total_tables} tables extracted")
+            if self.gpu_restarts:
+                print(f"  GPU server restarts: {self.gpu_restarts}")
+            print(f"  Wall time: {elapsed:.1f}s "
+                  f"({elapsed / max(1, total):.1f}s/file)")
+            print(f"{'='*60}", flush=True)
+            return elapsed
+        finally:
+            # t13：无论正常完成、超时还是子进程崩溃，都回收所有子进程。
+            # 正常路径的 worker/gpu 已在上面 join 过，_cleanup_children 幂等。
+            self._cleanup_children()
 
 
 def _mem_available_mib() -> float:

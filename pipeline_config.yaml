@@ -79,6 +79,19 @@ scheduler:
   max_active_books: 50       # 同时开工的书上限（其余排队）
   max_active_pages: 1500     # P25 B1：活跃书总页数阀门（大书自然低并发；0=关闭）
   instance_lock_file: /tmp/assay_v2_pipeline.lock  # P25 A5：单实例 flock（勿放 NFS）
+  # ── t13/t16：假死防护（不要依赖人工 kill）────────────────────────────
+  # 事故：4 个小 PDF 时 worker/GPU 子进程全部退出，父进程 100% CPU 空转 2h
+  #（退出条件只看 done_count，没人消费 task_q → 永远收敛不了）。
+  # 真正的根因（t14 已修）是 models.py 在 import 期递归扫描 HOME，导致主循环
+  # 根本没开始跑；那类故障由 import 侧修复兜住，不靠下面的超时。
+  # 秒级主防线 = worker/GPU 进程存活巡检（与耗时无关，恒有效，无阈值可调）。
+  # total_timeout_s 默认 **0 = 关闭**：生产公告量中位数 1473、P90 3368、峰值
+  # 28975 个 PDF，而 v2 尚未在该量级跑过基准，任何固定上限都可能误杀。
+  # 如需启用，请先跑一次真实批量拿到吞吐基线，再按 基线 × 安全系数 显式填写
+  # （例：仅调试小批量时临时设为 300）。0 或负数 = 不做整轮超时。
+  total_timeout_s: 0
+  gpu_dead_grace_s: 10.0      # GPU 进程死亡后的重启宽限（秒），超出即判定不可恢复
+  fail_fast_on_worker_exit: true   # true=任一 CPU worker 退出立即 fail-loud；false=仅在全部退出时判定
 
 budgets:
   # 页预算调度器：在制页 ≤256、在制 crop ≤512、在制书 ≤50。
